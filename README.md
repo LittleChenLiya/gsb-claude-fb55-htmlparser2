@@ -115,6 +115,39 @@ All callbacks are optional. The handler object you pass to `Parser` may implemen
 | `recognizeSelfClosing`   | `boolean` | `xmlMode`  | Recognize self-closing tags (e.g. `<br/>`). Always enabled in `xmlMode`.                                                                                 |
 | `recognizeCDATA`         | `boolean` | `xmlMode`  | Recognize CDATA sections as text. Always enabled in `xmlMode`.                                                                                           |
 
+### Pausing and resuming
+
+The parser can be paused at any time — typically from within an event callback — and resumed later:
+
+```js
+const parser = new htmlparser2.Parser({
+    onopentagname(name) {
+        if (name === "script") {
+            // Stop after the current event; continue later with `parser.resume()`.
+            parser.pause();
+        }
+    },
+});
+parser.write("<div><script>alert(1)</script>");
+// ...later, for example once backpressure has cleared:
+parser.resume();
+parser.end();
+```
+
+- `parser.pause()` returns an explicit acknowledgment: `true` if the parser was running and is now paused, `false` if it was already paused. `parser.paused` reflects the current state.
+- The pause takes effect at the boundary of the event currently being delivered: the current event completes and no further events are emitted. The unparsed rest of the current chunk — and any chunks written while paused — is retained and parsed when `resume` is called. No event is emitted twice.
+- `end()` while paused does not complete early: `onend` only fires once `resume` has been called and all retained input has been parsed.
+- `end()` called from within an event callback is settled after the current chunk has been parsed; `onend` fires exactly once.
+- Entities split across chunks (e.g. `&am` + `p;`) are decoded across the chunk boundary and delivered as a single text event once complete.
+- Every `Parser` instance keeps its own buffers; instances never share staging state.
+- If an event callback throws, the error propagates and the parser is left in an incomplete state — call `parser.reset()` (or discard the parser) before parsing again.
+
+A runnable example covering these cases is available at [`examples/pauseResume.mjs`](examples/pauseResume.mjs):
+
+```sh
+npm run build && node examples/pauseResume.mjs
+```
+
 ### Usage with streams
 
 While the `Parser` interface closely resembles Node.js streams, it's not a 100% match.

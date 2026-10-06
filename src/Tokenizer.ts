@@ -197,6 +197,14 @@ export default class Tokenizer {
     running = true;
     /** The offset of the current buffer. */
     private offset = 0;
+    /** Whether trailing data has been flushed and `onend` has been emitted. */
+    private finished = false;
+    /** Whether the tokenizer is currently inside of a `parse` pass. */
+    private parsing = false;
+    /** Whether `end` was called from within an event callback. */
+    private endDuringParse = false;
+    /** Chunks written re-entrantly from within event callbacks. */
+    private readonly queuedChunks: string[] = [];
 
     private readonly xmlMode: boolean;
     private readonly decodeEntities: boolean;
@@ -235,25 +243,63 @@ export default class Tokenizer {
         this.sequenceIndex = 0;
         this.running = true;
         this.offset = 0;
+        this.finished = false;
+        this.parsing = false;
+        this.endDuringParse = false;
+        this.queuedChunks.length = 0;
     }
 
     write(chunk: string): void {
+        if (this.parsing) {
+            /*
+             * Re-entrant write from within an event callback: queue the chunk
+             * and let the current parse pass pick it up after the current
+             * buffer, so the buffer being parsed is not replaced mid-pass.
+             */
+            this.queuedChunks.push(chunk);
+            return;
+        }
+
         this.offset += this.buffer.length;
         this.buffer = chunk;
         this.parse();
     }
 
     end(): void {
-        if (this.running) this.finish();
+        if (this.parsing) {
+            /*
+             * Re-entrant end from within an event callback: finish once the
+             * current parse pass has completed, so the rest of the current
+             * buffer is still parsed before `onend` is emitted.
+             */
+            this.endDuringParse = true;
+        } else if (this.running) {
+            this.finish();
+        }
     }
 
-    pause(): void {
+    /**
+     * Pauses the tokenizer.
+     *
+     * The pause takes effect at the boundary of the event currently being
+     * delivered: no further events are emitted until `resume` is called, and
+     * the remainder of the current buffer is retained.
+     * @returns Whether the pause was acknowledged — `true` if the tokenizer
+     * was running and is now paused, `false` if it was already paused.
+     */
+    pause(): boolean {
+        const wasRunning = this.running;
         this.running = false;
+        return wasRunning;
     }
 
     resume(): void {
         this.running = true;
-        if (this.index < this.buffer.length + this.offset) {
+        if (
+            !this.finished &&
+            (this.queuedChunks.length > 0 ||
+                this.index < this.buffer.length + this.offset)
+        ) {
             this.parse();
         }
     }
@@ -490,11 +536,21 @@ export default class Tokenizer {
                 const endOfText = this.index - this.currentSequence.length;
 
                 if (this.sectionStart < endOfText) {
-                    // Spoof the index so that reported locations match up.
+                    /*
+                     * Spoof the index so that reported locations match up.
+                     * Update `sectionStart` before emitting, so that the text
+                     * is not emitted again if the character is re-processed
+                     * after a pause.
+                     */
                     const actualIndex = this.index;
+                    const { sectionStart } = this;
+                    this.sectionStart = endOfText;
                     this.index = endOfText;
-                    this.cbs.ontext(this.sectionStart, endOfText);
+                    this.cbs.ontext(sectionStart, endOfText);
                     this.index = actualIndex;
+                    if (this.pausedMidEvent()) {
+                        return;
+                    }
                 }
 
                 this.isSpecial = false;
@@ -568,6 +624,9 @@ export default class Tokenizer {
             this.cbs.onopentagname(this.sectionStart, this.index);
             this.sectionStart = -1;
             this.state = State.BeforeAttributeName;
+            if (this.pausedMidEvent()) {
+                return;
+            }
             this.stateBeforeAttributeName(c);
         }
     }
@@ -596,6 +655,9 @@ export default class Tokenizer {
             this.cbs.onclosetag(this.sectionStart, this.index);
             this.sectionStart = -1;
             this.state = State.AfterClosingTagName;
+            if (this.pausedMidEvent()) {
+                return;
+            }
             this.stateAfterClosingTagName(c);
         }
     }
@@ -650,6 +712,9 @@ export default class Tokenizer {
             this.cbs.onattribname(this.sectionStart, this.index);
             this.sectionStart = this.index;
             this.state = State.AfterAttributeName;
+            if (this.pausedMidEvent()) {
+                return;
+            }
             this.stateAfterAttributeName(c);
         }
     }
@@ -660,6 +725,9 @@ export default class Tokenizer {
             this.cbs.onattribend(QuoteType.NoValue, this.sectionStart);
             this.sectionStart = -1;
             this.state = State.BeforeAttributeName;
+            if (this.pausedMidEvent()) {
+                return;
+            }
             this.stateBeforeAttributeName(c);
         } else if (!isWhitespace(c)) {
             this.cbs.onattribend(QuoteType.NoValue, this.sectionStart);
@@ -710,6 +778,9 @@ export default class Tokenizer {
             this.sectionStart = -1;
             this.cbs.onattribend(QuoteType.Unquoted, this.index);
             this.state = State.BeforeAttributeName;
+            if (this.pausedMidEvent()) {
+                return;
+            }
             this.stateBeforeAttributeName(c);
         } else if (this.decodeEntities && c === CharCodes.Amp) {
             this.startEntity();
@@ -891,126 +962,180 @@ export default class Tokenizer {
     }
 
     /**
+     * Check whether parsing was paused while the current event was being
+     * delivered.
+     *
+     * If so, the index is rewound so that the current character is
+     * re-processed once parsing resumes, and the caller should return early.
+     * @returns Whether parsing was paused.
+     */
+    private pausedMidEvent(): boolean {
+        if (this.running) {
+            return false;
+        }
+
+        // Re-process the current character when parsing resumes.
+        this.index--;
+        return true;
+    }
+
+    /**
+     * Move on to a chunk that was written re-entrantly from within an event
+     * callback.
+     * @returns Whether there was a queued chunk to continue with.
+     */
+    private shiftQueuedChunk(): boolean {
+        const chunk = this.queuedChunks.shift();
+
+        if (chunk === undefined) {
+            return false;
+        }
+
+        this.offset += this.buffer.length;
+        this.buffer = chunk;
+        return true;
+    }
+
+    /**
      * Iterates through the buffer, calling the function corresponding to the current state.
      *
      * States that are more likely to be hit are higher up, as a performance improvement.
      */
     private parse() {
-        while (this.shouldContinue()) {
-            const c = this.buffer.charCodeAt(this.index - this.offset);
-            switch (this.state) {
-                case State.Text: {
-                    this.stateText(c);
-                    break;
+        this.parsing = true;
+        try {
+            do {
+                while (this.shouldContinue()) {
+                    const c = this.buffer.charCodeAt(this.index - this.offset);
+                    switch (this.state) {
+                        case State.Text: {
+                            this.stateText(c);
+                            break;
+                        }
+                        case State.InPlainText: {
+                            // Skip to end of buffer; cleanup() emits the text.
+                            this.index = this.buffer.length + this.offset - 1;
+                            break;
+                        }
+                        case State.SpecialStartSequence: {
+                            this.stateSpecialStartSequence(c);
+                            break;
+                        }
+                        case State.InSpecialTag: {
+                            this.stateInSpecialTag(c);
+                            break;
+                        }
+                        case State.CDATASequence: {
+                            this.stateCDATASequence(c);
+                            break;
+                        }
+                        case State.DeclarationSequence: {
+                            this.stateDeclarationSequence(c);
+                            break;
+                        }
+                        case State.InAttributeValueDq: {
+                            this.stateInAttributeValueDoubleQuotes(c);
+                            break;
+                        }
+                        case State.InAttributeName: {
+                            this.stateInAttributeName(c);
+                            break;
+                        }
+                        case State.InCommentLike: {
+                            this.stateInCommentLike(c);
+                            break;
+                        }
+                        case State.InSpecialComment: {
+                            this.stateInSpecialComment(c);
+                            break;
+                        }
+                        case State.BeforeAttributeName: {
+                            this.stateBeforeAttributeName(c);
+                            break;
+                        }
+                        case State.InTagName: {
+                            this.stateInTagName(c);
+                            break;
+                        }
+                        case State.InClosingTagName: {
+                            this.stateInClosingTagName(c);
+                            break;
+                        }
+                        case State.BeforeTagName: {
+                            this.stateBeforeTagName(c);
+                            break;
+                        }
+                        case State.AfterAttributeName: {
+                            this.stateAfterAttributeName(c);
+                            break;
+                        }
+                        case State.InAttributeValueSq: {
+                            this.stateInAttributeValueSingleQuotes(c);
+                            break;
+                        }
+                        case State.BeforeAttributeValue: {
+                            this.stateBeforeAttributeValue(c);
+                            break;
+                        }
+                        case State.BeforeClosingTagName: {
+                            this.stateBeforeClosingTagName(c);
+                            break;
+                        }
+                        case State.AfterClosingTagName: {
+                            this.stateAfterClosingTagName(c);
+                            break;
+                        }
+                        case State.InAttributeValueNq: {
+                            this.stateInAttributeValueNoQuotes(c);
+                            break;
+                        }
+                        case State.InSelfClosingTag: {
+                            this.stateInSelfClosingTag(c);
+                            break;
+                        }
+                        case State.InDeclaration: {
+                            this.stateInDeclaration(c);
+                            break;
+                        }
+                        case State.BeforeDeclaration: {
+                            this.stateBeforeDeclaration(c);
+                            break;
+                        }
+                        case State.BeforeComment: {
+                            this.stateBeforeComment(c);
+                            break;
+                        }
+                        case State.InProcessingInstruction: {
+                            this.stateInProcessingInstruction(c);
+                            break;
+                        }
+                        case State.InEntity: {
+                            this.stateInEntity();
+                            break;
+                        }
+                    }
+                    this.index++;
                 }
-                case State.InPlainText: {
-                    // Skip to end of buffer; cleanup() emits the text.
-                    this.index = this.buffer.length + this.offset - 1;
-                    break;
-                }
-                case State.SpecialStartSequence: {
-                    this.stateSpecialStartSequence(c);
-                    break;
-                }
-                case State.InSpecialTag: {
-                    this.stateInSpecialTag(c);
-                    break;
-                }
-                case State.CDATASequence: {
-                    this.stateCDATASequence(c);
-                    break;
-                }
-                case State.DeclarationSequence: {
-                    this.stateDeclarationSequence(c);
-                    break;
-                }
-                case State.InAttributeValueDq: {
-                    this.stateInAttributeValueDoubleQuotes(c);
-                    break;
-                }
-                case State.InAttributeName: {
-                    this.stateInAttributeName(c);
-                    break;
-                }
-                case State.InCommentLike: {
-                    this.stateInCommentLike(c);
-                    break;
-                }
-                case State.InSpecialComment: {
-                    this.stateInSpecialComment(c);
-                    break;
-                }
-                case State.BeforeAttributeName: {
-                    this.stateBeforeAttributeName(c);
-                    break;
-                }
-                case State.InTagName: {
-                    this.stateInTagName(c);
-                    break;
-                }
-                case State.InClosingTagName: {
-                    this.stateInClosingTagName(c);
-                    break;
-                }
-                case State.BeforeTagName: {
-                    this.stateBeforeTagName(c);
-                    break;
-                }
-                case State.AfterAttributeName: {
-                    this.stateAfterAttributeName(c);
-                    break;
-                }
-                case State.InAttributeValueSq: {
-                    this.stateInAttributeValueSingleQuotes(c);
-                    break;
-                }
-                case State.BeforeAttributeValue: {
-                    this.stateBeforeAttributeValue(c);
-                    break;
-                }
-                case State.BeforeClosingTagName: {
-                    this.stateBeforeClosingTagName(c);
-                    break;
-                }
-                case State.AfterClosingTagName: {
-                    this.stateAfterClosingTagName(c);
-                    break;
-                }
-                case State.InAttributeValueNq: {
-                    this.stateInAttributeValueNoQuotes(c);
-                    break;
-                }
-                case State.InSelfClosingTag: {
-                    this.stateInSelfClosingTag(c);
-                    break;
-                }
-                case State.InDeclaration: {
-                    this.stateInDeclaration(c);
-                    break;
-                }
-                case State.BeforeDeclaration: {
-                    this.stateBeforeDeclaration(c);
-                    break;
-                }
-                case State.BeforeComment: {
-                    this.stateBeforeComment(c);
-                    break;
-                }
-                case State.InProcessingInstruction: {
-                    this.stateInProcessingInstruction(c);
-                    break;
-                }
-                case State.InEntity: {
-                    this.stateInEntity();
-                    break;
-                }
-            }
-            this.index++;
+                this.cleanup();
+            } while (this.running && this.shiftQueuedChunk());
+        } finally {
+            this.parsing = false;
         }
-        this.cleanup();
+
+        if (this.endDuringParse) {
+            this.endDuringParse = false;
+            if (this.running) {
+                this.finish();
+            }
+        }
     }
 
     private finish() {
+        if (this.finished) {
+            return;
+        }
+        this.finished = true;
+
         if (this.state === State.InEntity) {
             this.entityDecoder.end();
             this.state = this.baseState;

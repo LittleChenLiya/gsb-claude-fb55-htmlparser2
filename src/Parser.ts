@@ -786,6 +786,12 @@ export class Parser implements Callbacks {
 
     /**
      * Parses the end of the buffer and clears the stack, calls onend.
+     *
+     * If the parser is currently paused, finalization is deferred: `onend`
+     * only fires once `resume` has been called and all buffered input has
+     * been parsed. If `end` is called from within an event callback, the
+     * current chunk is parsed to its end before `onend` fires. `onend` fires
+     * exactly once.
      * @param chunk Optional final chunk to parse.
      */
     end(chunk?: string): void {
@@ -801,13 +807,34 @@ export class Parser implements Callbacks {
 
     /**
      * Pauses parsing. The parser won't emit events until `resume` is called.
+     *
+     * The pause takes effect at the boundary of the event currently being
+     * delivered: the current event completes, and no further events are
+     * emitted. Any remaining input — including the unparsed rest of the
+     * chunk currently being parsed — is retained and continues to be parsed
+     * when `resume` is called, without re-emitting events.
+     * @returns Whether the pause was acknowledged — `true` if the parser was
+     * running and is now paused, `false` if it was already paused.
      */
-    pause(): void {
-        this.tokenizer.pause();
+    pause(): boolean {
+        return this.tokenizer.pause();
+    }
+
+    /**
+     * Whether the parser is currently paused.
+     */
+    get paused(): boolean {
+        return !this.tokenizer.running;
     }
 
     /**
      * Resumes parsing after `pause` was called.
+     *
+     * Parsing continues exactly where it stopped: retained input from the
+     * chunk that was being parsed when `pause` was called is parsed first,
+     * followed by any chunks written while paused. No event is emitted
+     * twice. If `end` was called while paused, `onend` fires once all
+     * retained input has been parsed.
      */
     resume(): void {
         this.tokenizer.resume();
