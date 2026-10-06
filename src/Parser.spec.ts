@@ -250,3 +250,225 @@ describe("API", () => {
         p.end();
     });
 });
+
+describe("pause/resume", () => {
+    it("should stop at the event boundary and only emit remaining events on resume", () => {
+        const events: string[] = [];
+        const p = new Parser({
+            onopentag(name) {
+                events.push(`opentag:${name}`);
+                // Pause while the second of three tags in one chunk is delivered
+                if (name === "b") p.pause();
+            },
+            onclosetag(name) {
+                events.push(`closetag:${name}`);
+            },
+        });
+
+        p.write("<a></a><b></b><c></c>");
+
+        // Events up to and including the one that paused were delivered
+        expect(events).toEqual(["opentag:a", "closetag:a", "opentag:b"]);
+        expect(p.paused).toBe(true);
+
+        p.resume();
+
+        // Resume emitted exactly the remaining events, without re-sending the prefix
+        expect(events).toEqual([
+            "opentag:a",
+            "closetag:a",
+            "opentag:b",
+            "closetag:b",
+            "opentag:c",
+            "closetag:c",
+        ]);
+        expect(p.paused).toBe(false);
+    });
+
+    it("should acknowledge pause requests explicitly", () => {
+        const p = new Parser(null);
+
+        // Not started yet: pause is accepted
+        expect(p.pause()).toBe(true);
+        expect(p.paused).toBe(true);
+        p.resume();
+        expect(p.paused).toBe(false);
+
+        // After the input EOF completed, there is nothing left to pause
+        p.end("<a></a>");
+        expect(p.pause()).toBe(false);
+    });
+
+    it("should keep remaining input of the current chunk when pausing", () => {
+        const events: string[] = [];
+        const p = new Parser({
+            ontext(data) {
+                events.push(data);
+                if (data === "one") p.pause();
+            },
+        });
+
+        p.write("one<b>two</b>three");
+        expect(events).toEqual(["one"]);
+
+        // Writing while paused queues the input
+        p.write("four");
+        expect(events).toEqual(["one"]);
+
+        p.resume();
+        expect(events).toEqual(["one", "two", "three", "four"]);
+        p.end();
+    });
+
+    it("should decode entities split across chunks as a single text", () => {
+        const events: string[] = [];
+        const p = new Parser({
+            ontext(data) {
+                events.push(data);
+            },
+        });
+
+        p.write("a&am");
+        p.write("p;b");
+        p.end();
+
+        // `&amp;` was split across chunks, but is delivered as one `&` text
+        expect(events).toEqual(["a", "&", "b"]);
+    });
+
+    it("should continue entities across chunks when pausing in between", () => {
+        const events: string[] = [];
+        const p = new Parser({
+            ontext(data) {
+                events.push(data);
+            },
+        });
+
+        p.write("x&am");
+        p.pause();
+        // The second half of the entity is queued while paused
+        p.write("p;y");
+        // The text before the entity is emitted once the entity resolves
+        expect(events).toEqual([]);
+        p.resume();
+        p.end();
+
+        expect(events).toEqual(["x", "&", "y"]);
+    });
+
+    it("should not complete early when end() is called in an event callback", () => {
+        const events: string[] = [];
+        const p = new Parser({
+            onopentagname(name) {
+                events.push(`opentagname:${name}`);
+                if (name === "a") p.end();
+            },
+            onclosetag(name, isImplied) {
+                events.push(`closetag:${name}:${isImplied}`);
+            },
+            onend() {
+                events.push("end");
+            },
+        });
+
+        p.write("<a><b><c>");
+
+        // EOF was finalized only after the remaining events of the chunk
+        expect(events).toEqual([
+            "opentagname:a",
+            "opentagname:b",
+            "opentagname:c",
+            "closetag:c:true",
+            "closetag:b:true",
+            "closetag:a:true",
+            "end",
+        ]);
+    });
+
+    it("should not call onend while paused, and only once", () => {
+        const onend = vi.fn();
+        const events: string[] = [];
+        const p = new Parser({
+            onopentagname(name) {
+                events.push(name);
+                if (name === "a") p.pause();
+            },
+            onend,
+        });
+
+        p.write("<a><b>");
+        p.end();
+        expect(onend).not.toHaveBeenCalled();
+
+        p.resume();
+        expect(events).toEqual(["a", "b"]);
+        expect(onend).toHaveBeenCalledTimes(1);
+
+        // A stray resume must not complete a second time
+        p.resume();
+        expect(onend).toHaveBeenCalledTimes(1);
+    });
+
+    it("should not share queued state between parser instances", () => {
+        const eventsA: string[] = [];
+        const eventsB: string[] = [];
+        const a = new Parser({
+            ontext(data) {
+                eventsA.push(data);
+                if (data === "a1") a.pause();
+            },
+        });
+        const b = new Parser({
+            ontext(data) {
+                eventsB.push(data);
+            },
+        });
+
+        a.write("a1<i>a2</i>");
+        b.write("b1<i>b2</i>");
+        b.end();
+
+        // The paused instance kept its remaining input; the other is unaffected
+        expect(eventsA).toEqual(["a1"]);
+        expect(eventsB).toEqual(["b1", "b2"]);
+
+        a.resume();
+        a.end();
+        expect(eventsA).toEqual(["a1", "a2"]);
+    });
+
+    it("should stay in a consistent state when a callback throws", () => {
+        const events: string[] = [];
+        const p = new Parser({
+            onopentag(name) {
+                events.push(`opentag:${name}`);
+                if (name === "a") throw new Error("boom");
+            },
+            ontext(data) {
+                events.push(`text:${data}`);
+            },
+        });
+
+        // The error propagates to the caller of `write`
+        expect(() => p.write("<a>t1<b>t2</b>")).toThrow("boom");
+        expect(events).toEqual(["opentag:a"]);
+        /*
+         * The failed event was finalized: the parser sits at the event
+         * boundary right after the `<a>` tag.
+         */
+        expect(p.startIndex).toBe(3);
+        expect(p.endIndex).toBe(2);
+
+        // Parsing continues at the event boundary; no event is delivered twice
+        p.write("<c>t3</c>");
+        p.end();
+        expect(events).toEqual([
+            "opentag:a",
+            "text:t1",
+            "opentag:b",
+            "text:t2",
+            "opentag:c",
+            "text:t3",
+        ]);
+    });
+});

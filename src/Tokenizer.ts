@@ -197,6 +197,12 @@ export default class Tokenizer {
     running = true;
     /** The offset of the current buffer. */
     private offset = 0;
+    /** Whether the tokenizer is currently inside of `parse()`. */
+    private parsing = false;
+    /** Whether `end()` has been called and input EOF was reached. */
+    private ended = false;
+    /** Whether the final `finish()` has run. Guards against duplicate `onend`. */
+    private finished = false;
 
     private readonly xmlMode: boolean;
     private readonly decodeEntities: boolean;
@@ -235,26 +241,72 @@ export default class Tokenizer {
         this.sequenceIndex = 0;
         this.running = true;
         this.offset = 0;
+        this.parsing = false;
+        this.ended = false;
+        this.finished = false;
     }
 
     write(chunk: string): void {
-        this.offset += this.buffer.length;
+        const indexInBuffer = this.index - this.offset;
+
+        if (indexInBuffer < this.buffer.length) {
+            /*
+             * The previous buffer wasn't fully consumed (eg. because a
+             * callback threw an error). Keep the remaining data and
+             * continue with it instead of silently dropping it.
+             */
+            chunk = this.buffer.slice(indexInBuffer) + chunk;
+            this.offset = this.index;
+        } else {
+            this.offset += this.buffer.length;
+        }
+
         this.buffer = chunk;
         this.parse();
     }
 
     end(): void {
-        if (this.running) this.finish();
+        this.ended = true;
+        this.finishIfDone();
     }
 
-    pause(): void {
+    /**
+     * Pauses the tokenizer.
+     * @returns `true` if the tokenizer is now paused, `false` if it had
+     * already finished and there was nothing left to pause.
+     */
+    pause(): boolean {
+        if (this.finished) {
+            return false;
+        }
         this.running = false;
+        return true;
     }
 
     resume(): void {
+        if (this.finished) {
+            return;
+        }
         this.running = true;
         if (this.index < this.buffer.length + this.offset) {
             this.parse();
+        } else {
+            this.finishIfDone();
+        }
+    }
+
+    /**
+     * Runs `finish()` once input EOF was signalled through `end()`, the
+     * tokenizer isn't paused and isn't currently in the middle of `parse()`.
+     *
+     * This defers completion when `end()` is called from within an event
+     * callback: the remaining events of the current chunk are delivered
+     * first, and `onend` is only emitted once the chunk is done.
+     */
+    private finishIfDone(): void {
+        if (this.ended && this.running && !this.parsing && !this.finished) {
+            this.finished = true;
+            this.finish();
         }
     }
 
@@ -264,10 +316,20 @@ export default class Tokenizer {
             (!this.decodeEntities && this.fastForwardTo(CharCodes.Lt))
         ) {
             if (this.index > this.sectionStart) {
-                this.cbs.ontext(this.sectionStart, this.index);
+                try {
+                    this.cbs.ontext(this.sectionStart, this.index);
+                } finally {
+                    /*
+                     * Finalize the transition even if the callback threw,
+                     * so the tokenizer stays at an event boundary.
+                     */
+                    this.state = State.BeforeTagName;
+                    this.sectionStart = this.index;
+                }
+            } else {
+                this.state = State.BeforeTagName;
+                this.sectionStart = this.index;
             }
-            this.state = State.BeforeTagName;
-            this.sectionStart = this.index;
         } else if (this.decodeEntities && c === CharCodes.Amp) {
             this.startEntity();
         }
@@ -400,10 +462,13 @@ export default class Tokenizer {
      * @param offset Number of characters in the end sequence that have already been matched.
      */
     private emitComment(offset: number): void {
-        this.cbs.oncomment(this.sectionStart, this.index, offset);
-        this.sequenceIndex = 0;
-        this.sectionStart = this.index + 1;
-        this.state = State.Text;
+        try {
+            this.cbs.oncomment(this.sectionStart, this.index, offset);
+        } finally {
+            this.sequenceIndex = 0;
+            this.sectionStart = this.index + 1;
+            this.state = State.Text;
+        }
     }
 
     /**
@@ -445,15 +510,17 @@ export default class Tokenizer {
             this.sequenceIndex = Number(c === CharCodes.Dash);
         } else if (c === this.currentSequence[this.sequenceIndex]) {
             if (++this.sequenceIndex === this.currentSequence.length) {
-                if (this.currentSequence === Sequences.CdataEnd) {
-                    this.cbs.oncdata(this.sectionStart, this.index, 2);
-                } else {
-                    this.cbs.oncomment(this.sectionStart, this.index, 3);
+                try {
+                    if (this.currentSequence === Sequences.CdataEnd) {
+                        this.cbs.oncdata(this.sectionStart, this.index, 2);
+                    } else {
+                        this.cbs.oncomment(this.sectionStart, this.index, 3);
+                    }
+                } finally {
+                    this.sequenceIndex = 0;
+                    this.sectionStart = this.index + 1;
+                    this.state = State.Text;
                 }
-
-                this.sequenceIndex = 0;
-                this.sectionStart = this.index + 1;
-                this.state = State.Text;
             }
         } else if (this.sequenceIndex === 0) {
             // Fast-forward to the first character of the sequence
@@ -489,17 +556,22 @@ export default class Tokenizer {
             if (isEndOfTagSection(c)) {
                 const endOfText = this.index - this.currentSequence.length;
 
-                if (this.sectionStart < endOfText) {
-                    // Spoof the index so that reported locations match up.
-                    const actualIndex = this.index;
-                    this.index = endOfText;
-                    this.cbs.ontext(this.sectionStart, endOfText);
-                    this.index = actualIndex;
+                try {
+                    if (this.sectionStart < endOfText) {
+                        // Spoof the index so that reported locations match up.
+                        const actualIndex = this.index;
+                        this.index = endOfText;
+                        try {
+                            this.cbs.ontext(this.sectionStart, endOfText);
+                        } finally {
+                            this.index = actualIndex;
+                        }
+                    }
+                } finally {
+                    this.isSpecial = false;
+                    this.sectionStart = endOfText + 2; // Skip over the `</`
+                    this.stateInClosingTagName(c);
                 }
-
-                this.isSpecial = false;
-                this.sectionStart = endOfText + 2; // Skip over the `</`
-                this.stateInClosingTagName(c);
                 return; // We are done; skip the rest of the function.
             }
 
@@ -565,10 +637,13 @@ export default class Tokenizer {
     }
     private stateInTagName(c: number): void {
         if (isEndOfTagSection(c)) {
-            this.cbs.onopentagname(this.sectionStart, this.index);
-            this.sectionStart = -1;
-            this.state = State.BeforeAttributeName;
-            this.stateBeforeAttributeName(c);
+            try {
+                this.cbs.onopentagname(this.sectionStart, this.index);
+            } finally {
+                this.sectionStart = -1;
+                this.state = State.BeforeAttributeName;
+                this.stateBeforeAttributeName(c);
+            }
         }
     }
     private stateBeforeClosingTagName(c: number): void {
@@ -593,10 +668,13 @@ export default class Tokenizer {
     }
     private stateInClosingTagName(c: number): void {
         if (isEndOfTagSection(c)) {
-            this.cbs.onclosetag(this.sectionStart, this.index);
-            this.sectionStart = -1;
-            this.state = State.AfterClosingTagName;
-            this.stateAfterClosingTagName(c);
+            try {
+                this.cbs.onclosetag(this.sectionStart, this.index);
+            } finally {
+                this.sectionStart = -1;
+                this.state = State.AfterClosingTagName;
+                this.stateAfterClosingTagName(c);
+            }
         }
     }
     private stateAfterClosingTagName(c: number): void {
@@ -608,9 +686,12 @@ export default class Tokenizer {
     }
     private stateBeforeAttributeName(c: number): void {
         if (c === CharCodes.Gt) {
-            this.cbs.onopentagend(this.index);
-            this.enterTagBody();
-            this.sectionStart = this.index + 1;
+            try {
+                this.cbs.onopentagend(this.index);
+            } finally {
+                this.enterTagBody();
+                this.sectionStart = this.index + 1;
+            }
         } else if (c === CharCodes.Slash) {
             this.state = State.InSelfClosingTag;
         } else if (!isWhitespace(c)) {
@@ -629,17 +710,19 @@ export default class Tokenizer {
      */
     private stateInSelfClosingTag(c: number): void {
         if (c === CharCodes.Gt) {
-            this.cbs.onselfclosingtag(this.index);
-            this.sectionStart = this.index + 1;
+            try {
+                this.cbs.onselfclosingtag(this.index);
+            } finally {
+                this.sectionStart = this.index + 1;
 
-            if (!this.recognizeSelfClosing) {
-                this.enterTagBody();
-                return;
+                if (this.recognizeSelfClosing) {
+                    this.state = State.Text;
+                    this.isSpecial = false; // Reset special state, in case of self-closing special tags
+                    this.currentSequence = Sequences.Empty;
+                } else {
+                    this.enterTagBody();
+                }
             }
-
-            this.state = State.Text;
-            this.isSpecial = false; // Reset special state, in case of self-closing special tags
-            this.currentSequence = Sequences.Empty;
         } else if (!isWhitespace(c)) {
             this.state = State.BeforeAttributeName;
             this.stateBeforeAttributeName(c);
@@ -647,24 +730,33 @@ export default class Tokenizer {
     }
     private stateInAttributeName(c: number): void {
         if (c === CharCodes.Eq || isEndOfTagSection(c)) {
-            this.cbs.onattribname(this.sectionStart, this.index);
-            this.sectionStart = this.index;
-            this.state = State.AfterAttributeName;
-            this.stateAfterAttributeName(c);
+            try {
+                this.cbs.onattribname(this.sectionStart, this.index);
+            } finally {
+                this.sectionStart = this.index;
+                this.state = State.AfterAttributeName;
+                this.stateAfterAttributeName(c);
+            }
         }
     }
     private stateAfterAttributeName(c: number): void {
         if (c === CharCodes.Eq) {
             this.state = State.BeforeAttributeValue;
         } else if (c === CharCodes.Slash || c === CharCodes.Gt) {
-            this.cbs.onattribend(QuoteType.NoValue, this.sectionStart);
-            this.sectionStart = -1;
-            this.state = State.BeforeAttributeName;
-            this.stateBeforeAttributeName(c);
+            try {
+                this.cbs.onattribend(QuoteType.NoValue, this.sectionStart);
+            } finally {
+                this.sectionStart = -1;
+                this.state = State.BeforeAttributeName;
+                this.stateBeforeAttributeName(c);
+            }
         } else if (!isWhitespace(c)) {
-            this.cbs.onattribend(QuoteType.NoValue, this.sectionStart);
-            this.state = State.InAttributeName;
-            this.sectionStart = this.index;
+            try {
+                this.cbs.onattribend(QuoteType.NoValue, this.sectionStart);
+            } finally {
+                this.state = State.InAttributeName;
+                this.sectionStart = this.index;
+            }
         }
     }
     private stateBeforeAttributeValue(c: number): void {
@@ -685,15 +777,19 @@ export default class Tokenizer {
             c === quote ||
             (!this.decodeEntities && this.fastForwardTo(quote))
         ) {
-            this.cbs.onattribdata(this.sectionStart, this.index);
-            this.sectionStart = -1;
-            this.cbs.onattribend(
-                quote === CharCodes.DoubleQuote
-                    ? QuoteType.Double
-                    : QuoteType.Single,
-                this.index + 1,
-            );
-            this.state = State.BeforeAttributeName;
+            try {
+                this.cbs.onattribdata(this.sectionStart, this.index);
+                this.sectionStart = -1;
+                this.cbs.onattribend(
+                    quote === CharCodes.DoubleQuote
+                        ? QuoteType.Double
+                        : QuoteType.Single,
+                    this.index + 1,
+                );
+            } finally {
+                this.sectionStart = -1;
+                this.state = State.BeforeAttributeName;
+            }
         } else if (this.decodeEntities && c === CharCodes.Amp) {
             this.startEntity();
         }
@@ -706,11 +802,15 @@ export default class Tokenizer {
     }
     private stateInAttributeValueNoQuotes(c: number): void {
         if (isWhitespace(c) || c === CharCodes.Gt) {
-            this.cbs.onattribdata(this.sectionStart, this.index);
-            this.sectionStart = -1;
-            this.cbs.onattribend(QuoteType.Unquoted, this.index);
-            this.state = State.BeforeAttributeName;
-            this.stateBeforeAttributeName(c);
+            try {
+                this.cbs.onattribdata(this.sectionStart, this.index);
+                this.sectionStart = -1;
+                this.cbs.onattribend(QuoteType.Unquoted, this.index);
+            } finally {
+                this.sectionStart = -1;
+                this.state = State.BeforeAttributeName;
+                this.stateBeforeAttributeName(c);
+            }
         } else if (this.decodeEntities && c === CharCodes.Amp) {
             this.startEntity();
         }
@@ -737,9 +837,12 @@ export default class Tokenizer {
             this.currentSequence = Sequences.Doctype;
             this.sequenceIndex = 1;
         } else if (c === CharCodes.Gt) {
-            this.cbs.oncomment(this.sectionStart, this.index, 0);
-            this.state = State.Text;
-            this.sectionStart = this.index + 1;
+            try {
+                this.cbs.oncomment(this.sectionStart, this.index, 0);
+            } finally {
+                this.state = State.Text;
+                this.sectionStart = this.index + 1;
+            }
         } else if (c === CharCodes.Dash) {
             this.state = State.BeforeComment;
         } else {
@@ -761,18 +864,24 @@ export default class Tokenizer {
         } else if ((c | 0x20) === this.currentSequence[this.sequenceIndex]) {
             this.sequenceIndex += 1;
         } else if (c === CharCodes.Gt) {
-            this.cbs.oncomment(this.sectionStart, this.index, 0);
-            this.state = State.Text;
-            this.sectionStart = this.index + 1;
+            try {
+                this.cbs.oncomment(this.sectionStart, this.index, 0);
+            } finally {
+                this.state = State.Text;
+                this.sectionStart = this.index + 1;
+            }
         } else {
             this.state = State.InSpecialComment;
         }
     }
     private stateInDeclaration(c: number): void {
         if (c === CharCodes.Gt || this.fastForwardTo(CharCodes.Gt)) {
-            this.cbs.ondeclaration(this.sectionStart, this.index);
-            this.state = State.Text;
-            this.sectionStart = this.index + 1;
+            try {
+                this.cbs.ondeclaration(this.sectionStart, this.index);
+            } finally {
+                this.state = State.Text;
+                this.sectionStart = this.index + 1;
+            }
         }
     }
     /**
@@ -787,10 +896,16 @@ export default class Tokenizer {
             // Remember that we just consumed `?`, so the next `>` closes the PI.
             this.sequenceIndex = 1;
         } else if (c === CharCodes.Gt && this.sequenceIndex === 1) {
-            this.cbs.onprocessinginstruction(this.sectionStart, this.index - 1);
-            this.sequenceIndex = 0;
-            this.state = State.Text;
-            this.sectionStart = this.index + 1;
+            try {
+                this.cbs.onprocessinginstruction(
+                    this.sectionStart,
+                    this.index - 1,
+                );
+            } finally {
+                this.sequenceIndex = 0;
+                this.state = State.Text;
+                this.sectionStart = this.index + 1;
+            }
         } else {
             // Keep scanning for the next `?`, which can start a closing `?>`.
             this.sequenceIndex = Number(
@@ -807,18 +922,24 @@ export default class Tokenizer {
         } else if (this.xmlMode) {
             this.state = State.InDeclaration;
         } else if (c === CharCodes.Gt) {
-            this.cbs.oncomment(this.sectionStart, this.index, 0);
-            this.state = State.Text;
-            this.sectionStart = this.index + 1;
+            try {
+                this.cbs.oncomment(this.sectionStart, this.index, 0);
+            } finally {
+                this.state = State.Text;
+                this.sectionStart = this.index + 1;
+            }
         } else {
             this.state = State.InSpecialComment;
         }
     }
     private stateInSpecialComment(c: number): void {
         if (c === CharCodes.Gt || this.fastForwardTo(CharCodes.Gt)) {
-            this.cbs.oncomment(this.sectionStart, this.index, 0);
-            this.state = State.Text;
-            this.sectionStart = this.index + 1;
+            try {
+                this.cbs.oncomment(this.sectionStart, this.index, 0);
+            } finally {
+                this.state = State.Text;
+                this.sectionStart = this.index + 1;
+            }
         }
     }
 
@@ -873,15 +994,21 @@ export default class Tokenizer {
                 this.state === State.InPlainText ||
                 (this.state === State.InSpecialTag && this.sequenceIndex === 0)
             ) {
-                this.cbs.ontext(this.sectionStart, this.index);
-                this.sectionStart = this.index;
+                try {
+                    this.cbs.ontext(this.sectionStart, this.index);
+                } finally {
+                    this.sectionStart = this.index;
+                }
             } else if (
                 this.state === State.InAttributeValueDq ||
                 this.state === State.InAttributeValueSq ||
                 this.state === State.InAttributeValueNq
             ) {
-                this.cbs.onattribdata(this.sectionStart, this.index);
-                this.sectionStart = this.index;
+                try {
+                    this.cbs.onattribdata(this.sectionStart, this.index);
+                } finally {
+                    this.sectionStart = this.index;
+                }
             }
         }
     }
@@ -896,118 +1023,132 @@ export default class Tokenizer {
      * States that are more likely to be hit are higher up, as a performance improvement.
      */
     private parse() {
-        while (this.shouldContinue()) {
-            const c = this.buffer.charCodeAt(this.index - this.offset);
-            switch (this.state) {
-                case State.Text: {
-                    this.stateText(c);
-                    break;
-                }
-                case State.InPlainText: {
-                    // Skip to end of buffer; cleanup() emits the text.
-                    this.index = this.buffer.length + this.offset - 1;
-                    break;
-                }
-                case State.SpecialStartSequence: {
-                    this.stateSpecialStartSequence(c);
-                    break;
-                }
-                case State.InSpecialTag: {
-                    this.stateInSpecialTag(c);
-                    break;
-                }
-                case State.CDATASequence: {
-                    this.stateCDATASequence(c);
-                    break;
-                }
-                case State.DeclarationSequence: {
-                    this.stateDeclarationSequence(c);
-                    break;
-                }
-                case State.InAttributeValueDq: {
-                    this.stateInAttributeValueDoubleQuotes(c);
-                    break;
-                }
-                case State.InAttributeName: {
-                    this.stateInAttributeName(c);
-                    break;
-                }
-                case State.InCommentLike: {
-                    this.stateInCommentLike(c);
-                    break;
-                }
-                case State.InSpecialComment: {
-                    this.stateInSpecialComment(c);
-                    break;
-                }
-                case State.BeforeAttributeName: {
-                    this.stateBeforeAttributeName(c);
-                    break;
-                }
-                case State.InTagName: {
-                    this.stateInTagName(c);
-                    break;
-                }
-                case State.InClosingTagName: {
-                    this.stateInClosingTagName(c);
-                    break;
-                }
-                case State.BeforeTagName: {
-                    this.stateBeforeTagName(c);
-                    break;
-                }
-                case State.AfterAttributeName: {
-                    this.stateAfterAttributeName(c);
-                    break;
-                }
-                case State.InAttributeValueSq: {
-                    this.stateInAttributeValueSingleQuotes(c);
-                    break;
-                }
-                case State.BeforeAttributeValue: {
-                    this.stateBeforeAttributeValue(c);
-                    break;
-                }
-                case State.BeforeClosingTagName: {
-                    this.stateBeforeClosingTagName(c);
-                    break;
-                }
-                case State.AfterClosingTagName: {
-                    this.stateAfterClosingTagName(c);
-                    break;
-                }
-                case State.InAttributeValueNq: {
-                    this.stateInAttributeValueNoQuotes(c);
-                    break;
-                }
-                case State.InSelfClosingTag: {
-                    this.stateInSelfClosingTag(c);
-                    break;
-                }
-                case State.InDeclaration: {
-                    this.stateInDeclaration(c);
-                    break;
-                }
-                case State.BeforeDeclaration: {
-                    this.stateBeforeDeclaration(c);
-                    break;
-                }
-                case State.BeforeComment: {
-                    this.stateBeforeComment(c);
-                    break;
-                }
-                case State.InProcessingInstruction: {
-                    this.stateInProcessingInstruction(c);
-                    break;
-                }
-                case State.InEntity: {
-                    this.stateInEntity();
-                    break;
+        this.parsing = true;
+        try {
+            while (this.shouldContinue()) {
+                const c = this.buffer.charCodeAt(this.index - this.offset);
+                try {
+                    switch (this.state) {
+                        case State.Text: {
+                            this.stateText(c);
+                            break;
+                        }
+                        case State.InPlainText: {
+                            // Skip to end of buffer; cleanup() emits the text.
+                            this.index = this.buffer.length + this.offset - 1;
+                            break;
+                        }
+                        case State.SpecialStartSequence: {
+                            this.stateSpecialStartSequence(c);
+                            break;
+                        }
+                        case State.InSpecialTag: {
+                            this.stateInSpecialTag(c);
+                            break;
+                        }
+                        case State.CDATASequence: {
+                            this.stateCDATASequence(c);
+                            break;
+                        }
+                        case State.DeclarationSequence: {
+                            this.stateDeclarationSequence(c);
+                            break;
+                        }
+                        case State.InAttributeValueDq: {
+                            this.stateInAttributeValueDoubleQuotes(c);
+                            break;
+                        }
+                        case State.InAttributeName: {
+                            this.stateInAttributeName(c);
+                            break;
+                        }
+                        case State.InCommentLike: {
+                            this.stateInCommentLike(c);
+                            break;
+                        }
+                        case State.InSpecialComment: {
+                            this.stateInSpecialComment(c);
+                            break;
+                        }
+                        case State.BeforeAttributeName: {
+                            this.stateBeforeAttributeName(c);
+                            break;
+                        }
+                        case State.InTagName: {
+                            this.stateInTagName(c);
+                            break;
+                        }
+                        case State.InClosingTagName: {
+                            this.stateInClosingTagName(c);
+                            break;
+                        }
+                        case State.BeforeTagName: {
+                            this.stateBeforeTagName(c);
+                            break;
+                        }
+                        case State.AfterAttributeName: {
+                            this.stateAfterAttributeName(c);
+                            break;
+                        }
+                        case State.InAttributeValueSq: {
+                            this.stateInAttributeValueSingleQuotes(c);
+                            break;
+                        }
+                        case State.BeforeAttributeValue: {
+                            this.stateBeforeAttributeValue(c);
+                            break;
+                        }
+                        case State.BeforeClosingTagName: {
+                            this.stateBeforeClosingTagName(c);
+                            break;
+                        }
+                        case State.AfterClosingTagName: {
+                            this.stateAfterClosingTagName(c);
+                            break;
+                        }
+                        case State.InAttributeValueNq: {
+                            this.stateInAttributeValueNoQuotes(c);
+                            break;
+                        }
+                        case State.InSelfClosingTag: {
+                            this.stateInSelfClosingTag(c);
+                            break;
+                        }
+                        case State.InDeclaration: {
+                            this.stateInDeclaration(c);
+                            break;
+                        }
+                        case State.BeforeDeclaration: {
+                            this.stateBeforeDeclaration(c);
+                            break;
+                        }
+                        case State.BeforeComment: {
+                            this.stateBeforeComment(c);
+                            break;
+                        }
+                        case State.InProcessingInstruction: {
+                            this.stateInProcessingInstruction(c);
+                            break;
+                        }
+                        case State.InEntity: {
+                            this.stateInEntity();
+                            break;
+                        }
+                    }
+                } finally {
+                    /*
+                     * Even if a callback threw an error, the current
+                     * character has been consumed: event emission sites
+                     * finalize their state transitions in `finally` blocks.
+                     */
+                    this.index++;
                 }
             }
-            this.index++;
+            this.cleanup();
+        } finally {
+            this.parsing = false;
         }
-        this.cleanup();
+        this.finishIfDone();
     }
 
     private finish() {
@@ -1130,19 +1271,25 @@ export default class Tokenizer {
             this.baseState !== State.Text &&
             this.baseState !== State.InSpecialTag
         ) {
-            if (this.sectionStart < this.entityStart) {
-                this.cbs.onattribdata(this.sectionStart, this.entityStart);
+            try {
+                if (this.sectionStart < this.entityStart) {
+                    this.cbs.onattribdata(this.sectionStart, this.entityStart);
+                }
+            } finally {
+                this.sectionStart = this.entityStart + consumed;
+                this.index = this.sectionStart - 1;
             }
-            this.sectionStart = this.entityStart + consumed;
-            this.index = this.sectionStart - 1;
 
             this.cbs.onattribentity(cp);
         } else {
-            if (this.sectionStart < this.entityStart) {
-                this.cbs.ontext(this.sectionStart, this.entityStart);
+            try {
+                if (this.sectionStart < this.entityStart) {
+                    this.cbs.ontext(this.sectionStart, this.entityStart);
+                }
+            } finally {
+                this.sectionStart = this.entityStart + consumed;
+                this.index = this.sectionStart - 1;
             }
-            this.sectionStart = this.entityStart + consumed;
-            this.index = this.sectionStart - 1;
 
             this.cbs.ontextentity(cp, this.sectionStart);
         }

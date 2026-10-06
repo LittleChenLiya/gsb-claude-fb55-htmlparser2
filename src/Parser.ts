@@ -288,6 +288,13 @@ export class Parser implements Callbacks {
     private writeIndex = 0;
     /** Indicates whether the parser has finished running / `.end` has been called. */
     private ended = false;
+    /**
+     * Indicates whether the parser is currently pushing queued buffers to the
+     * tokenizer. Re-entrant calls (eg. `write()` or `end()` from within an
+     * event callback) only queue their input; the outermost `pump()` call
+     * takes care of delivering it, keeping events in order.
+     */
+    private pumping = false;
 
     constructor(
         cbs?: Partial<Handler> | null,
@@ -318,8 +325,11 @@ export class Parser implements Callbacks {
     ontext(start: number, endIndex: number): void {
         const data = this.getSlice(start, endIndex);
         this.endIndex = endIndex - 1;
-        this.cbs.ontext?.(data);
-        this.startIndex = endIndex;
+        try {
+            this.cbs.ontext?.(data);
+        } finally {
+            this.startIndex = endIndex;
+        }
     }
 
     /**
@@ -329,8 +339,11 @@ export class Parser implements Callbacks {
      */
     ontextentity(cp: number, endIndex: number): void {
         this.endIndex = endIndex - 1;
-        this.cbs.ontext?.(fromCodePoint(cp));
-        this.startIndex = endIndex;
+        try {
+            this.cbs.ontext?.(fromCodePoint(cp));
+        } finally {
+            this.startIndex = endIndex;
+        }
     }
 
     /** @internal */
@@ -435,22 +448,27 @@ export class Parser implements Callbacks {
                 }
             }
         }
-        this.cbs.onopentagname?.(name);
-        if (this.cbs.onopentag) this.attribs = {};
+        try {
+            this.cbs.onopentagname?.(name);
+        } finally {
+            if (this.cbs.onopentag) this.attribs = {};
+        }
     }
 
     private endOpenTag(isImplied: boolean) {
         this.startIndex = this.openTagStart;
 
-        if (this.attribs) {
-            this.cbs.onopentag?.(this.tagname, this.attribs, isImplied);
+        try {
+            if (this.attribs) {
+                this.cbs.onopentag?.(this.tagname, this.attribs, isImplied);
+            }
+            if (this.cbs.onclosetag && this.isVoidElement(this.tagname)) {
+                this.cbs.onclosetag(this.tagname, true);
+            }
+        } finally {
             this.attribs = null;
+            this.tagname = "";
         }
-        if (this.cbs.onclosetag && this.isVoidElement(this.tagname)) {
-            this.cbs.onclosetag(this.tagname, true);
-        }
-
-        this.tagname = "";
     }
 
     /**
@@ -459,10 +477,12 @@ export class Parser implements Callbacks {
      */
     onopentagend(endIndex: number): void {
         this.endIndex = endIndex;
-        this.endOpenTag(false);
-
-        // Set `startIndex` for next node
-        this.startIndex = endIndex + 1;
+        try {
+            this.endOpenTag(false);
+        } finally {
+            // Set `startIndex` for next node
+            this.startIndex = endIndex + 1;
+        }
     }
 
     /**
@@ -472,29 +492,31 @@ export class Parser implements Callbacks {
      */
     onclosetag(start: number, endIndex: number): void {
         this.endIndex = endIndex;
-        const name = this.readTagName(start, endIndex);
+        try {
+            const name = this.readTagName(start, endIndex);
 
-        if (!this.isVoidElement(name)) {
-            const pos = this.stack.indexOf(name);
-            if (pos !== -1) {
-                for (let index = 0; index < pos; index++) {
-                    this.popElement(true);
+            if (!this.isVoidElement(name)) {
+                const pos = this.stack.indexOf(name);
+                if (pos !== -1) {
+                    for (let index = 0; index < pos; index++) {
+                        this.popElement(true);
+                    }
+                    this.popElement(false);
+                } else if (this.htmlMode && name === "p") {
+                    // Implicit open before close
+                    this.emitOpenTag("p");
+                    this.closeCurrentTag(true);
                 }
-                this.popElement(false);
-            } else if (this.htmlMode && name === "p") {
-                // Implicit open before close
-                this.emitOpenTag("p");
-                this.closeCurrentTag(true);
+            } else if (this.htmlMode && name === "br") {
+                // We can't use `emitOpenTag` for implicit open, as `br` would be implicitly closed.
+                this.cbs.onopentagname?.("br");
+                this.cbs.onopentag?.("br", {}, true);
+                this.cbs.onclosetag?.("br", false);
             }
-        } else if (this.htmlMode && name === "br") {
-            // We can't use `emitOpenTag` for implicit open, as `br` would be implicitly closed.
-            this.cbs.onopentagname?.("br");
-            this.cbs.onopentag?.("br", {}, true);
-            this.cbs.onclosetag?.("br", false);
+        } finally {
+            // Set `startIndex` for next node
+            this.startIndex = endIndex + 1;
         }
-
-        // Set `startIndex` for next node
-        this.startIndex = endIndex + 1;
     }
 
     /**
@@ -504,10 +526,12 @@ export class Parser implements Callbacks {
     onselfclosingtag(endIndex: number): void {
         this.endIndex = endIndex;
         if (this.recognizeSelfClosing || this.isInForeignContext()) {
-            this.closeCurrentTag(false);
-
-            // Set `startIndex` for next node
-            this.startIndex = endIndex + 1;
+            try {
+                this.closeCurrentTag(false);
+            } finally {
+                // Set `startIndex` for next node
+                this.startIndex = endIndex + 1;
+            }
         } else {
             // Ignore the fact that the tag is self-closing.
             this.onopentagend(endIndex);
@@ -581,22 +605,25 @@ export class Parser implements Callbacks {
     onattribend(quote: QuoteType, endIndex: number): void {
         this.endIndex = endIndex;
 
-        this.cbs.onattribute?.(
-            this.attribname,
-            this.attribvalue,
-            quote === QuoteType.Double
-                ? '"'
-                : quote === QuoteType.Single
-                  ? "'"
-                  : quote === QuoteType.NoValue
-                    ? undefined
-                    : null,
-        );
+        try {
+            this.cbs.onattribute?.(
+                this.attribname,
+                this.attribvalue,
+                quote === QuoteType.Double
+                    ? '"'
+                    : quote === QuoteType.Single
+                      ? "'"
+                      : quote === QuoteType.NoValue
+                        ? undefined
+                        : null,
+            );
 
-        if (this.attribs && !Object.hasOwn(this.attribs, this.attribname)) {
-            this.attribs[this.attribname] = this.attribvalue;
+            if (this.attribs && !Object.hasOwn(this.attribs, this.attribname)) {
+                this.attribs[this.attribname] = this.attribvalue;
+            }
+        } finally {
+            this.attribvalue = "";
         }
-        this.attribvalue = "";
     }
 
     private getInstructionName(value: string) {
@@ -619,21 +646,23 @@ export class Parser implements Callbacks {
         this.endIndex = endIndex;
         const value = this.getSlice(start, endIndex);
 
-        if (this.cbs.onprocessinginstruction) {
-            /*
-             * In HTML mode, ondeclaration is only reached for DOCTYPE
-             * (the tokenizer routes everything else to bogus comments).
-             */
-            const name = this.htmlMode
-                ? this.lowerCaseTagNames
-                    ? DOCUMENT_TYPE
-                    : value.slice(0, DOCUMENT_TYPE.length)
-                : this.getInstructionName(value);
-            this.cbs.onprocessinginstruction(`!${name}`, `!${value}`);
+        try {
+            if (this.cbs.onprocessinginstruction) {
+                /*
+                 * In HTML mode, ondeclaration is only reached for DOCTYPE
+                 * (the tokenizer routes everything else to bogus comments).
+                 */
+                const name = this.htmlMode
+                    ? this.lowerCaseTagNames
+                        ? DOCUMENT_TYPE
+                        : value.slice(0, DOCUMENT_TYPE.length)
+                    : this.getInstructionName(value);
+                this.cbs.onprocessinginstruction(`!${name}`, `!${value}`);
+            }
+        } finally {
+            // Set `startIndex` for next node
+            this.startIndex = endIndex + 1;
         }
-
-        // Set `startIndex` for next node
-        this.startIndex = endIndex + 1;
     }
 
     /**
@@ -645,13 +674,15 @@ export class Parser implements Callbacks {
         this.endIndex = endIndex;
         const value = this.getSlice(start, endIndex);
 
-        if (this.cbs.onprocessinginstruction) {
-            const name = this.getInstructionName(value);
-            this.cbs.onprocessinginstruction(`?${name}`, `?${value}`);
+        try {
+            if (this.cbs.onprocessinginstruction) {
+                const name = this.getInstructionName(value);
+                this.cbs.onprocessinginstruction(`?${name}`, `?${value}`);
+            }
+        } finally {
+            // Set `startIndex` for next node
+            this.startIndex = endIndex + 1;
         }
-
-        // Set `startIndex` for next node
-        this.startIndex = endIndex + 1;
     }
 
     /**
@@ -663,11 +694,13 @@ export class Parser implements Callbacks {
     oncomment(start: number, endIndex: number, offset: number): void {
         this.endIndex = endIndex;
 
-        this.cbs.oncomment?.(this.getSlice(start, endIndex - offset));
-        this.cbs.oncommentend?.();
-
-        // Set `startIndex` for next node
-        this.startIndex = endIndex + 1;
+        try {
+            this.cbs.oncomment?.(this.getSlice(start, endIndex - offset));
+            this.cbs.oncommentend?.();
+        } finally {
+            // Set `startIndex` for next node
+            this.startIndex = endIndex + 1;
+        }
     }
 
     /**
@@ -680,19 +713,21 @@ export class Parser implements Callbacks {
         this.endIndex = endIndex;
         const value = this.getSlice(start, endIndex - offset);
 
-        if (!this.htmlMode || this.options.recognizeCDATA) {
-            this.cbs.oncdatastart?.();
-            this.cbs.ontext?.(value);
-            this.cbs.oncdataend?.();
-        } else if (this.isInForeignContext()) {
-            this.cbs.ontext?.(value);
-        } else {
-            this.cbs.oncomment?.(`[CDATA[${value}]]`);
-            this.cbs.oncommentend?.();
+        try {
+            if (!this.htmlMode || this.options.recognizeCDATA) {
+                this.cbs.oncdatastart?.();
+                this.cbs.ontext?.(value);
+                this.cbs.oncdataend?.();
+            } else if (this.isInForeignContext()) {
+                this.cbs.ontext?.(value);
+            } else {
+                this.cbs.oncomment?.(`[CDATA[${value}]]`);
+                this.cbs.oncommentend?.();
+            }
+        } finally {
+            // Set `startIndex` for next node
+            this.startIndex = endIndex + 1;
         }
-
-        // Set `startIndex` for next node
-        this.startIndex = endIndex + 1;
     }
 
     /** @internal */
@@ -768,6 +803,41 @@ export class Parser implements Callbacks {
     }
 
     /**
+     * Push queued buffers to the tokenizer until it is paused or all input
+     * has been consumed, then signal input EOF if `end()` was called.
+     *
+     * Re-entrant calls from within event callbacks only queue their input;
+     * the outermost call delivers it. This keeps events in order and makes
+     * sure EOF (`onend`) is only signaled after every queued event —
+     * including the rest of the chunk currently being parsed — was emitted.
+     */
+    private pump(): void {
+        if (this.pumping) {
+            return;
+        }
+
+        this.pumping = true;
+        try {
+            while (
+                this.tokenizer.running &&
+                this.writeIndex < this.buffers.length
+            ) {
+                this.tokenizer.write(this.buffers[this.writeIndex++]);
+            }
+
+            if (
+                this.ended &&
+                this.tokenizer.running &&
+                this.writeIndex === this.buffers.length
+            ) {
+                this.tokenizer.end();
+            }
+        } finally {
+            this.pumping = false;
+        }
+    }
+
+    /**
      * Parses a chunk of data and calls the corresponding callbacks.
      * @param chunk Chunk to parse.
      */
@@ -778,14 +848,15 @@ export class Parser implements Callbacks {
         }
 
         this.buffers.push(chunk);
-        if (this.tokenizer.running) {
-            this.tokenizer.write(chunk);
-            this.writeIndex++;
-        }
+        this.pump();
     }
 
     /**
      * Parses the end of the buffer and clears the stack, calls onend.
+     *
+     * When called from within an event callback, completion is deferred:
+     * the remaining events of the current chunk are delivered first, and
+     * `onend` is only called once all queued input has been parsed.
      * @param chunk Optional final chunk to parse.
      */
     end(chunk?: string): void {
@@ -796,14 +867,26 @@ export class Parser implements Callbacks {
 
         if (chunk) this.write(chunk);
         this.ended = true;
-        this.tokenizer.end();
+        this.pump();
     }
 
     /**
      * Pauses parsing. The parser won't emit events until `resume` is called.
+     *
+     * Pausing takes effect at the next event boundary: the event currently
+     * being delivered (if any) is completed, and the remaining input of the
+     * current chunk is kept in the parser's queue. `resume()` continues
+     * exactly where parsing stopped, without re-emitting events.
+     * @returns `true` if the parser is now paused, `false` if parsing had
+     * already finished and there was nothing left to pause.
      */
-    pause(): void {
-        this.tokenizer.pause();
+    pause(): boolean {
+        return this.tokenizer.pause();
+    }
+
+    /** Whether the parser is currently paused. */
+    get paused(): boolean {
+        return !this.tokenizer.running;
     }
 
     /**
@@ -811,14 +894,6 @@ export class Parser implements Callbacks {
      */
     resume(): void {
         this.tokenizer.resume();
-
-        while (
-            this.tokenizer.running &&
-            this.writeIndex < this.buffers.length
-        ) {
-            this.tokenizer.write(this.buffers[this.writeIndex++]);
-        }
-
-        if (this.ended) this.tokenizer.end();
+        this.pump();
     }
 }

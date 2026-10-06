@@ -115,6 +115,64 @@ All callbacks are optional. The handler object you pass to `Parser` may implemen
 | `recognizeSelfClosing`   | `boolean` | `xmlMode`  | Recognize self-closing tags (e.g. `<br/>`). Always enabled in `xmlMode`.                                                                                 |
 | `recognizeCDATA`         | `boolean` | `xmlMode`  | Recognize CDATA sections as text. Always enabled in `xmlMode`.                                                                                           |
 
+### Pausing and resuming
+
+`parser.pause()` stops the parser at the next event boundary and returns an explicit
+receipt: `true` when the parser is now paused, `false` when parsing had already
+finished and there was nothing left to pause. The `parser.paused` getter reports the
+current state. Input that hasn't been parsed yet — including the remainder of the
+chunk currently being written — is kept in the parser's queue, and `parser.resume()`
+continues exactly where parsing stopped, without re-emitting events. Calling
+`parser.end()` while paused (or from within an event callback) is finalized only
+after all queued events were delivered, so `onend` never fires early or twice.
+
+```js
+import { Parser } from "htmlparser2";
+
+const parser = new Parser({
+    onopentag(name) {
+        console.log("open:", name);
+        if (name === "b" && parser.pause()) {
+            console.log("-- paused --");
+            setImmediate(() => parser.resume());
+        }
+    },
+    onclosetag(name) {
+        console.log("close:", name);
+    },
+    onend() {
+        console.log("done");
+    },
+});
+
+// Three tags in a single chunk; pauses on the second one.
+parser.end("<a></a><b></b><c></c>");
+```
+
+Save as `pause-example.mjs` and run with Node.js:
+
+```sh
+node pause-example.mjs
+```
+
+Output — `resume()` only emits the remaining events:
+
+```
+open: a
+close: a
+open: b
+-- paused --
+close: b
+open: c
+close: c
+done
+```
+
+If a callback throws, the error propagates to the caller of `write()` / `end()`.
+The event that failed is still finalized — the parser stays at the event boundary
+and the rest of the current chunk is kept, so parsing can continue with the next
+`write()` without events being dropped or delivered twice.
+
 ### Usage with streams
 
 While the `Parser` interface closely resembles Node.js streams, it's not a 100% match.
