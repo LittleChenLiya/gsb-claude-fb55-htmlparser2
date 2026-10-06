@@ -1,6 +1,6 @@
 import { Parser, type ParserOptions } from "./Parser.js";
 
-export type { Handler, ParserOptions } from "./Parser.js";
+export type { EntitySourceRange, Handler, ParserOptions } from "./Parser.js";
 export { Parser } from "./Parser.js";
 
 import {

@@ -109,10 +109,35 @@ export enum QuoteType {
 
 /**
  * Low-level tokenizer callback interface.
+ *
+ * All indices are absolute UTF-16 code unit offsets into the concatenation
+ * of every string passed to `write` (matching `String.prototype.charCodeAt`
+ * / `slice` semantics). They keep growing across chunks and are never reset
+ * per chunk, so entity and text ranges line up on one unified absolute
+ * scale.
  */
 export interface Callbacks {
     onattribdata(start: number, endIndex: number): void;
-    onattribentity(codepoint: number): void;
+    /**
+     * Called for every code point decoded from an entity inside an attribute
+     * value.
+     *
+     * `startIndex` and `endIndex` give the entity's explicit source range as
+     * absolute UTF-16 code unit indices (half-open `[startIndex, endIndex)`),
+     * covering the full entity from `&` to the last consumed character. A
+     * single decoded character can therefore map to multiple source code
+     * units — never derive source positions from decoded output lengths.
+     * Entities that decode to multiple code points report the same range for
+     * every code point.
+     * @param codepoint The decoded Unicode code point.
+     * @param startIndex Absolute index of the entity's `&` in the input.
+     * @param endIndex Absolute index one past the entity's last character.
+     */
+    onattribentity(
+        codepoint: number,
+        startIndex: number,
+        endIndex: number,
+    ): void;
     onattribend(quote: QuoteType, endIndex: number): void;
     onattribname(start: number, endIndex: number): void;
     oncdata(start: number, endIndex: number, endOffset: number): void;
@@ -125,7 +150,21 @@ export interface Callbacks {
     onprocessinginstruction(start: number, endIndex: number): void;
     onselfclosingtag(endIndex: number): void;
     ontext(start: number, endIndex: number): void;
-    ontextentity(codepoint: number, endIndex: number): void;
+    /**
+     * Called for every code point decoded from an entity in text.
+     *
+     * `startIndex` and `endIndex` give the entity's explicit source range as
+     * absolute UTF-16 code unit indices (half-open `[startIndex, endIndex)`),
+     * unified with the ranges reported for plain `ontext` fragments and
+     * stable across chunk boundaries. A single decoded character can map to
+     * multiple source code units, so source positions must not be shifted by
+     * decoded output lengths. Entities that decode to multiple code points
+     * report the same range for every code point.
+     * @param codepoint The decoded Unicode code point.
+     * @param startIndex Absolute index of the entity's `&` in the input.
+     * @param endIndex Absolute index one past the entity's last character.
+     */
+    ontextentity(codepoint: number, startIndex: number, endIndex: number): void;
     isInForeignContext?(): boolean;
 }
 
@@ -1125,7 +1164,20 @@ export default class Tokenizer {
         }
     }
 
+    /**
+     * Emit a decoded entity code point with its explicit source range.
+     *
+     * `consumed` counts UTF-16 code units of the input and is identical for
+     * every code point of a single entity, so all of them map to the same
+     * absolute `[entityStart, entityEnd)` source range — one decoded
+     * character can correspond to multiple source code units, and the range
+     * is never derived from the decoded output length.
+     * @param cp The decoded Unicode code point.
+     * @param consumed Number of input code units the entity consumed.
+     */
     private emitCodePoint(cp: number, consumed: number): void {
+        const entityEnd = this.entityStart + consumed;
+
         if (
             this.baseState !== State.Text &&
             this.baseState !== State.InSpecialTag
@@ -1133,18 +1185,18 @@ export default class Tokenizer {
             if (this.sectionStart < this.entityStart) {
                 this.cbs.onattribdata(this.sectionStart, this.entityStart);
             }
-            this.sectionStart = this.entityStart + consumed;
-            this.index = this.sectionStart - 1;
+            this.sectionStart = entityEnd;
+            this.index = entityEnd - 1;
 
-            this.cbs.onattribentity(cp);
+            this.cbs.onattribentity(cp, this.entityStart, entityEnd);
         } else {
             if (this.sectionStart < this.entityStart) {
                 this.cbs.ontext(this.sectionStart, this.entityStart);
             }
-            this.sectionStart = this.entityStart + consumed;
-            this.index = this.sectionStart - 1;
+            this.sectionStart = entityEnd;
+            this.index = entityEnd - 1;
 
-            this.cbs.ontextentity(cp, this.sectionStart);
+            this.cbs.ontextentity(cp, this.entityStart, entityEnd);
         }
     }
 }

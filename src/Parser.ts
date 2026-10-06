@@ -255,6 +255,23 @@ export interface Handler {
 const reNameEnd = /\s|\//;
 
 /**
+ * The explicit source range of a decoded entity.
+ *
+ * Indices are absolute UTF-16 code unit offsets into the concatenation of
+ * all chunks written to the parser (the same unit as
+ * `String.prototype.charCodeAt` / `slice`), half-open `[start, end)`.
+ * One decoded character can span multiple source code units, so these
+ * ranges are recorded while tokenizing instead of being shifted by the
+ * decoded output length.
+ */
+export interface EntitySourceRange {
+    /** Absolute index of the entity's leading `&`. */
+    start: number;
+    /** Absolute index one past the entity's last consumed character. */
+    end: number;
+}
+
+/**
  * Incremental parser implementation.
  */
 export class Parser implements Callbacks {
@@ -271,6 +288,19 @@ export class Parser implements Callbacks {
     private tagname = "";
     private attribname = "";
     private attribvalue = "";
+    /**
+     * Explicit source ranges of the entities decoded into the current
+     * attribute value, in source order.
+     *
+     * Attribute entities get positions of their own (independent of the
+     * text-event `startIndex`/`endIndex` pair): the array is cleared when a
+     * new attribute name starts and is stable while `onattribute` and
+     * `onopentag` handlers run. Ranges are absolute, half-open
+     * `[start, end)` UTF-16 code unit indices into the concatenated input;
+     * entities that decode to several code points contribute one entry per
+     * code point, all sharing the entity's range.
+     */
+    readonly attribEntityRanges: EntitySourceRange[] = [];
     private attribs: null | { [key: string]: string } = null;
     private readonly stack: string[] = [];
     private readonly foreignContext: ForeignContext[];
@@ -324,10 +354,18 @@ export class Parser implements Callbacks {
 
     /**
      * @param cp Current Unicode code point.
-     * @param endIndex End index for the current parser event.
+     * @param startIndex Absolute index of the entity's leading `&`.
+     * @param endIndex Absolute index one past the entity's last character.
      * @internal
      */
-    ontextentity(cp: number, endIndex: number): void {
+    ontextentity(cp: number, startIndex: number, endIndex: number): void {
+        /*
+         * Point `startIndex`/`endIndex` at the entity's explicit source
+         * range while the `ontext` handler runs: the decoded character maps
+         * to the complete entity (`&amp;` → `&` reports the full `&amp;`
+         * span), not to a position shifted by the decoded output length.
+         */
+        this.startIndex = startIndex;
         this.endIndex = endIndex - 1;
         this.cbs.ontext?.(fromCodePoint(cp));
         this.startIndex = endIndex;
@@ -554,6 +592,8 @@ export class Parser implements Callbacks {
         this.attribname = this.lowerCaseAttributeNames
             ? name.toLowerCase()
             : name;
+        // A new attribute starts: previous entity ranges no longer apply.
+        this.attribEntityRanges.length = 0;
     }
 
     /**
@@ -567,10 +607,13 @@ export class Parser implements Callbacks {
 
     /**
      * @param cp Current Unicode code point.
+     * @param startIndex Absolute index of the entity's leading `&`.
+     * @param endIndex Absolute index one past the entity's last character.
      * @internal
      */
-    onattribentity(cp: number): void {
+    onattribentity(cp: number, startIndex: number, endIndex: number): void {
         this.attribvalue += fromCodePoint(cp);
+        this.attribEntityRanges.push({ start: startIndex, end: endIndex });
     }
 
     /**
@@ -716,6 +759,7 @@ export class Parser implements Callbacks {
         this.tagname = "";
         this.attribname = "";
         this.attribvalue = "";
+        this.attribEntityRanges.length = 0;
         this.attribs = null;
         this.stack.length = 0;
         this.startIndex = 0;

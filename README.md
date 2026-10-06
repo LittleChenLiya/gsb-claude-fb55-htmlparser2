@@ -104,6 +104,76 @@ All callbacks are optional. The handler object you pass to `Parser` may implemen
 | `onend()`                                    | Fires when parsing is complete.                                                                                                                  |
 | `onerror(error)`                             | Fires on error.                                                                                                                                  |
 
+### Entity source ranges
+
+Decoded entities come with an explicit map back to their source. One decoded
+character can correspond to multiple source code units (`&amp;` → `&`), so
+positions are reported while tokenizing — never shifted by the decoded output
+length, and never re-derived by a second parse.
+
+**Index units:** all positions are absolute UTF-16 code unit indices into the
+concatenation of every string passed to `parser.write()` (the same unit as
+`String.prototype.charCodeAt` / `slice`). They keep growing across chunks, so
+an entity split over a chunk boundary and a plain text fragment share one
+unified absolute scale. `parser.startIndex` / `parser.endIndex` follow the
+parser's usual inclusive-end convention; the low-level tokenizer callbacks and
+`attribEntityRanges` use half-open `[start, end)` ranges.
+
+- **Text entities:** while an `ontext` handler runs, `parser.startIndex` and
+  `parser.endIndex` point at the complete entity in the source. Parsing
+  `a&amp;b` emits `a`, `&`, `b`, and for the `&` event
+  `startIndex === 1` / `endIndex === 5` — exactly the `&amp;` span.
+- **Attribute entities:** `parser.attribEntityRanges` holds the independent
+  `{ start, end }` source ranges of the entities decoded into the current
+  attribute value. It is reset per attribute and is stable while `onattribute`
+  and `onopentag` handlers run.
+- **Invalid entities** are passed through as literal text, exactly as before,
+  and produce no entity ranges. The decoded text output is unchanged.
+
+Example (three entity forms decoding to `&`, fed byte by byte):
+
+```js
+import { Parser } from "htmlparser2";
+
+const input = `<p title="a&amp;b">&amp;&#38;&#x26;</p>`;
+const parser = new Parser({
+    ontext(data) {
+        console.log(
+            `text ${JSON.stringify(data)} <- [${parser.startIndex}, ${
+                parser.endIndex + 1
+            }) ${JSON.stringify(
+                input.slice(parser.startIndex, parser.endIndex + 1),
+            )}`,
+        );
+    },
+    onattribute(name, value) {
+        console.log(
+            `attr ${name}=${JSON.stringify(value)} entities:`,
+            parser.attribEntityRanges,
+        );
+    },
+});
+for (let index = 0; index < input.length; index++) {
+    parser.write(input.charAt(index)); // byte-by-byte input maps identically
+}
+parser.end();
+```
+
+Output:
+
+```
+attr title="a&b" entities: [ { start: 11, end: 16 } ]
+text "&" <- [19, 24) "&amp;"
+text "&" <- [24, 29) "&#38;"
+text "&" <- [29, 35) "&#x26;"
+```
+
+A runnable version of this demo ships in `examples/entity-source-map.mjs`:
+
+```sh
+npm run build && node examples/entity-source-map.mjs
+```
+
 ### Parser options
 
 | Option                   | Type      | Default    | Description                                                                                                                                              |
