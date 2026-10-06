@@ -115,6 +115,42 @@ All callbacks are optional. The handler object you pass to `Parser` may implemen
 | `recognizeSelfClosing`   | `boolean` | `xmlMode`  | Recognize self-closing tags (e.g. `<br/>`). Always enabled in `xmlMode`.                                                                                 |
 | `recognizeCDATA`         | `boolean` | `xmlMode`  | Recognize CDATA sections as text. Always enabled in `xmlMode`.                                                                                           |
 
+### Source indices and entity mapping
+
+`parser.startIndex` / `parser.endIndex` report the source range of the current event.
+All indices are absolute offsets into the concatenated input written so far, counted in **UTF-16 code units** — the same units as JavaScript string indices and `String.prototype.length`, not byte offsets. `endIndex` is inclusive (it is the index of the event's last character).
+
+Decoded entities get an explicit source mapping: a single decoded character can correspond to several source characters, so the range is reported directly from the tokenizer instead of being shifted by the length of the decoded output. Parsing `a&amp;b` emits the text `a&b` in three events, and the decoded `&` covers the complete entity source:
+
+| text | startIndex | endIndex | source slice |
+| ---- | ---------- | -------- | ------------ |
+| `a`  | 0          | 0        | `a`          |
+| `&`  | 1          | 5        | `&amp;`      |
+| `b`  | 6          | 6        | `b`          |
+
+Ranges are absolute and identical no matter how the input is chunked — writing the document in one piece or byte by byte yields the same mapping, even for entities split across chunk boundaries. Plain text fragments and decoded entities share a single index space, and no second pass over the input is needed to report them. Entities inside attribute values get their own independent positions via `parser.attribEntityRanges` (meaningful while `onattribute` fires). Invalid entities (eg. `&;`) are not decoded and remain part of the surrounding plain text, as before.
+
+The low-level `Tokenizer` callbacks `ontextentity(codepoint, startIndex, endIndex)` and `onattribentity(codepoint, startIndex, endIndex)` expose the same explicit ranges (with an exclusive `endIndex`) if you consume the tokenizer directly.
+
+Try it with three entities — `&lt;&amp;&gt;` decodes to `<&>`, and each decoded character points at its complete entity source:
+
+```console
+$ node --input-type=module -e "
+import { Parser } from 'htmlparser2';
+let parser;
+parser = new Parser({
+    onparserinit(p) { parser = p; },
+    ontext(text) { console.log(JSON.stringify(text), parser.startIndex, parser.endIndex); },
+});
+parser.end('&lt;&amp;&gt;');
+"
+"<" 0 3
+"&" 4 8
+">" 9 12
+```
+
+Here `&lt;` spans indices 0–3, `&amp;` spans 4–8 and `&gt;` spans 9–12 of the input `&lt;&amp;&gt;`.
+
 ### Usage with streams
 
 While the `Parser` interface closely resembles Node.js streams, it's not a 100% match.

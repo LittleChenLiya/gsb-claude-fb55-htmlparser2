@@ -258,10 +258,39 @@ const reNameEnd = /\s|\//;
  * Incremental parser implementation.
  */
 export class Parser implements Callbacks {
-    /** The start index of the last event. */
+    /**
+     * The start index of the last event.
+     *
+     * Indices are absolute offsets into the concatenated input written so
+     * far, counted in UTF-16 code units (JavaScript string indices — not
+     * byte offsets). For text produced by decoding an entity, this is the
+     * index of the entity's leading `&`; a single decoded character can
+     * thus map to a multi-character source range.
+     */
     startIndex = 0;
-    /** The end index of the last event. */
+    /**
+     * The end index of the last event (inclusive — the index of the last
+     * source character of the event). See {@link startIndex} for the index
+     * semantics. For text produced by decoding an entity, this is the index
+     * of the entity's final character, so the event covers the complete
+     * entity source (eg. `&amp;` for the decoded text `&`).
+     */
     endIndex = 0;
+    /**
+     * Source ranges of the entities decoded within the value of the
+     * attribute currently being reported.
+     *
+     * Attribute values are delivered to `onattribute` as a single decoded
+     * string, so entity positions within them are exposed separately here:
+     * each entry marks the complete source of one decoded entity, with
+     * `startIndex` pointing at the leading `&` and `endIndex` at the final
+     * character (inclusive), using the same absolute UTF-16 code unit
+     * indices as {@link startIndex}. The array is reused across attributes
+     * and is only meaningful while `onattribute` (or a subsequent
+     * `onopentag`) is being called.
+     */
+    readonly attribEntityRanges: { startIndex: number; endIndex: number }[] =
+        [];
     /**
      * Store the start index of the current open tag,
      * so we can update the start index for attributes.
@@ -324,10 +353,13 @@ export class Parser implements Callbacks {
 
     /**
      * @param cp Current Unicode code point.
-     * @param endIndex End index for the current parser event.
+     * @param startIndex Start index of the entity in the input (the leading `&`).
+     * @param endIndex End index (exclusive) of the entity in the input.
      * @internal
      */
-    ontextentity(cp: number, endIndex: number): void {
+    ontextentity(cp: number, startIndex: number, endIndex: number): void {
+        // Report the entity's explicit source range, not a shifted position.
+        this.startIndex = startIndex;
         this.endIndex = endIndex - 1;
         this.cbs.ontext?.(fromCodePoint(cp));
         this.startIndex = endIndex;
@@ -549,6 +581,7 @@ export class Parser implements Callbacks {
      */
     onattribname(start: number, endIndex: number): void {
         this.startIndex = start;
+        this.attribEntityRanges.length = 0;
         const name = this.getSlice(start, endIndex);
 
         this.attribname = this.lowerCaseAttributeNames
@@ -567,10 +600,17 @@ export class Parser implements Callbacks {
 
     /**
      * @param cp Current Unicode code point.
+     * @param startIndex Start index of the entity in the input (the leading `&`).
+     * @param endIndex End index (exclusive) of the entity in the input.
      * @internal
      */
-    onattribentity(cp: number): void {
+    onattribentity(cp: number, startIndex: number, endIndex: number): void {
         this.attribvalue += fromCodePoint(cp);
+        /*
+         * Record the entity's own source range, independent of the
+         * surrounding attribute value fragments.
+         */
+        this.attribEntityRanges.push({ startIndex, endIndex: endIndex - 1 });
     }
 
     /**
@@ -716,6 +756,7 @@ export class Parser implements Callbacks {
         this.tagname = "";
         this.attribname = "";
         this.attribvalue = "";
+        this.attribEntityRanges.length = 0;
         this.attribs = null;
         this.stack.length = 0;
         this.startIndex = 0;

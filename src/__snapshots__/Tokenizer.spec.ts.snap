@@ -349,11 +349,13 @@ exports[`Tokenizer > should handle entities > for XML entities 1`] = `
   [
     "ontextentity",
     38,
+    0,
     5,
   ],
   [
     "ontextentity",
     62,
+    5,
     9,
   ],
   [
@@ -364,6 +366,7 @@ exports[`Tokenizer > should handle entities > for XML entities 1`] = `
   [
     "ontextentity",
     60,
+    13,
     17,
   ],
   [
@@ -374,6 +377,7 @@ exports[`Tokenizer > should handle entities > for XML entities 1`] = `
   [
     "ontextentity",
     97,
+    23,
     29,
   ],
   [
@@ -384,6 +388,7 @@ exports[`Tokenizer > should handle entities > for XML entities 1`] = `
   [
     "ontextentity",
     99,
+    34,
     39,
   ],
   [
@@ -417,6 +422,8 @@ exports[`Tokenizer > should handle entities > for entities in attributes (#276) 
   [
     "onattribentity",
     8465,
+    24,
+    31,
   ],
   [
     "onattribdata",
@@ -440,6 +447,7 @@ exports[`Tokenizer > should handle entities > for entities in attributes (#276) 
   [
     "ontextentity",
     8465,
+    58,
     65,
   ],
   [
@@ -458,11 +466,13 @@ exports[`Tokenizer > should handle entities > for multi-byte entities 1`] = `
   [
     "ontextentity",
     8807,
+    0,
     21,
   ],
   [
     "ontextentity",
     824,
+    0,
     21,
   ],
   [
@@ -476,11 +486,13 @@ exports[`Tokenizer > should handle entities > for trailing legacy entity 1`] = `
   [
     "ontextentity",
     10801,
+    0,
     10,
   ],
   [
     "ontextentity",
     215,
+    10,
     16,
   ],
   [
@@ -724,6 +736,7 @@ exports[`Tokenizer > should not break after special tag followed by an entity > 
   [
     "ontextentity",
     39,
+    18,
     24,
   ],
   [
@@ -755,6 +768,7 @@ exports[`Tokenizer > should not break after special tag followed by an entity > 
   [
     "ontextentity",
     39,
+    9,
     15,
   ],
   [
@@ -799,6 +813,7 @@ exports[`Tokenizer > should not lose data when pausing 1`] = `
   [
     "ontextentity",
     38,
+    0,
     5,
   ],
   [

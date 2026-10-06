@@ -109,10 +109,34 @@ export enum QuoteType {
 
 /**
  * Low-level tokenizer callback interface.
+ *
+ * All indices are absolute offsets into the concatenated input written so
+ * far, counted in UTF-16 code units (that is, JavaScript string indices —
+ * not byte offsets). Ranges are half-open: `start` is the index of the
+ * first character and `endIndex` is one past the last character.
+ *
+ * Entity callbacks carry an explicit source range: a single decoded code
+ * point can correspond to several source characters (eg. `&amp;` decodes
+ * to `&`), so the range is reported directly instead of being derived
+ * from the length of the decoded output. The range always covers the
+ * complete entity source, from the leading `&` up to and including the
+ * final character (usually `;`), even when the entity was split across
+ * multiple `write()` chunks. Entities that decode to more than one code
+ * point fire the callback once per code point, each time with the same
+ * full source range.
  */
 export interface Callbacks {
     onattribdata(start: number, endIndex: number): void;
-    onattribentity(codepoint: number): void;
+    /**
+     * @param codepoint The decoded code point.
+     * @param startIndex Absolute index of the entity's leading `&`.
+     * @param endIndex Absolute index one past the entity's last character.
+     */
+    onattribentity(
+        codepoint: number,
+        startIndex: number,
+        endIndex: number,
+    ): void;
     onattribend(quote: QuoteType, endIndex: number): void;
     onattribname(start: number, endIndex: number): void;
     oncdata(start: number, endIndex: number, endOffset: number): void;
@@ -125,7 +149,12 @@ export interface Callbacks {
     onprocessinginstruction(start: number, endIndex: number): void;
     onselfclosingtag(endIndex: number): void;
     ontext(start: number, endIndex: number): void;
-    ontextentity(codepoint: number, endIndex: number): void;
+    /**
+     * @param codepoint The decoded code point.
+     * @param startIndex Absolute index of the entity's leading `&`.
+     * @param endIndex Absolute index one past the entity's last character.
+     */
+    ontextentity(codepoint: number, startIndex: number, endIndex: number): void;
     isInForeignContext?(): boolean;
 }
 
@@ -1126,6 +1155,13 @@ export default class Tokenizer {
     }
 
     private emitCodePoint(cp: number, consumed: number): void {
+        /*
+         * `entityStart` and `consumed` are absolute (they span chunk
+         * boundaries), so the reported range covers the complete entity
+         * source no matter how the input was chunked.
+         */
+        const entityEnd = this.entityStart + consumed;
+
         if (
             this.baseState !== State.Text &&
             this.baseState !== State.InSpecialTag
@@ -1133,18 +1169,18 @@ export default class Tokenizer {
             if (this.sectionStart < this.entityStart) {
                 this.cbs.onattribdata(this.sectionStart, this.entityStart);
             }
-            this.sectionStart = this.entityStart + consumed;
+            this.sectionStart = entityEnd;
             this.index = this.sectionStart - 1;
 
-            this.cbs.onattribentity(cp);
+            this.cbs.onattribentity(cp, this.entityStart, entityEnd);
         } else {
             if (this.sectionStart < this.entityStart) {
                 this.cbs.ontext(this.sectionStart, this.entityStart);
             }
-            this.sectionStart = this.entityStart + consumed;
+            this.sectionStart = entityEnd;
             this.index = this.sectionStart - 1;
 
-            this.cbs.ontextentity(cp, this.sectionStart);
+            this.cbs.ontextentity(cp, this.entityStart, entityEnd);
         }
     }
 }
