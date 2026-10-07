@@ -239,6 +239,26 @@ export interface Handler {
         value: string,
         quote?: string | undefined | null,
     ): void;
+    /**
+     * Observes attributes whose name was already seen on the current tag.
+     *
+     * Called once for every repeated occurrence of an attribute name within
+     * the same tag (that is, from the second occurrence onwards). The
+     * comparison follows the parser's attribute name handling: in HTML mode
+     * names are case-folded (so `A` and `a` collide), while in XML mode the
+     * comparison is exact. The final attribute map keeps the first value;
+     * this hook only reports the duplicates and does not change that.
+     * @param tagName Name of the tag the attribute appears on.
+     * @param attributeName Name of the repeated attribute (after case folding, if enabled).
+     * @param value Original value of this occurrence of the attribute.
+     * @param previousValue Value of the first occurrence, which is the one kept in the final attribute map.
+     */
+    onduplicateattribute?(
+        tagName: string,
+        attributeName: string,
+        value: string,
+        previousValue: string,
+    ): void;
     onopentag(
         name: string,
         attribs: { [s: string]: string },
@@ -436,7 +456,9 @@ export class Parser implements Callbacks {
             }
         }
         this.cbs.onopentagname?.(name);
-        if (this.cbs.onopentag) this.attribs = {};
+        if (this.cbs.onopentag || this.cbs.onduplicateattribute) {
+            this.attribs = {};
+        }
     }
 
     private endOpenTag(isImplied: boolean) {
@@ -593,8 +615,17 @@ export class Parser implements Callbacks {
                     : null,
         );
 
-        if (this.attribs && !Object.hasOwn(this.attribs, this.attribname)) {
-            this.attribs[this.attribname] = this.attribvalue;
+        if (this.attribs) {
+            if (Object.hasOwn(this.attribs, this.attribname)) {
+                this.cbs.onduplicateattribute?.(
+                    this.tagname,
+                    this.attribname,
+                    this.attribvalue,
+                    this.attribs[this.attribname],
+                );
+            } else {
+                this.attribs[this.attribname] = this.attribvalue;
+            }
         }
         this.attribvalue = "";
     }

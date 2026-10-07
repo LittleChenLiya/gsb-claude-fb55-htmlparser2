@@ -4178,6 +4178,17 @@ exports[`Events > double attribute 1`] = `
     "startIndex": 15,
   },
   {
+    "$event": "duplicateattribute",
+    "data": [
+      "h1",
+      "class",
+      "boo",
+      "test",
+    ],
+    "endIndex": 24,
+    "startIndex": 15,
+  },
+  {
     "$event": "opentag",
     "data": [
       "h1",

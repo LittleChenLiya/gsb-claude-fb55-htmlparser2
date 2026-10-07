@@ -249,4 +249,125 @@ describe("API", () => {
         );
         p.end();
     });
+
+    describe("onduplicateattribute", () => {
+        const html = '<div A="1" a="2" A="3" b="x">';
+
+        it("should report repeated attributes with tag, name and original values in HTML mode", () => {
+            const onduplicateattribute = vi.fn();
+            const onopentag = vi.fn();
+
+            new Parser({ onduplicateattribute, onopentag }).end(html);
+
+            // `A`/`a` collide after HTML case folding; first value wins.
+            expect(onduplicateattribute).toHaveBeenCalledTimes(2);
+            expect(onduplicateattribute).toHaveBeenNthCalledWith(
+                1,
+                "div",
+                "a",
+                "2",
+                "1",
+            );
+            expect(onduplicateattribute).toHaveBeenNthCalledWith(
+                2,
+                "div",
+                "a",
+                "3",
+                "1",
+            );
+            // The final attribute map keeps the first occurrence.
+            expect(onopentag).toHaveBeenCalledTimes(1);
+            expect(onopentag).toHaveBeenCalledWith(
+                "div",
+                { a: "1", b: "x" },
+                false,
+            );
+        });
+
+        it("should report the same duplicates for character-by-character input", () => {
+            const onduplicateattribute = vi.fn();
+            const onopentag = vi.fn();
+            const p = new Parser({ onduplicateattribute, onopentag });
+
+            for (const char of html) {
+                p.write(char);
+            }
+            p.end();
+
+            expect(onduplicateattribute).toHaveBeenCalledTimes(2);
+            expect(onduplicateattribute).toHaveBeenNthCalledWith(
+                1,
+                "div",
+                "a",
+                "2",
+                "1",
+            );
+            expect(onduplicateattribute).toHaveBeenNthCalledWith(
+                2,
+                "div",
+                "a",
+                "3",
+                "1",
+            );
+            expect(onopentag).toHaveBeenCalledWith(
+                "div",
+                { a: "1", b: "x" },
+                false,
+            );
+        });
+
+        it("should compare attribute names exactly in XML mode", () => {
+            const onduplicateattribute = vi.fn();
+            const onopentag = vi.fn();
+            const options = { xmlMode: true };
+
+            // `A` and `a` are distinct attributes in XML mode.
+            new Parser({ onduplicateattribute, onopentag }, options).end(
+                '<div A="1" a="2"/>',
+            );
+            expect(onduplicateattribute).not.toHaveBeenCalled();
+            expect(onopentag).toHaveBeenCalledWith(
+                "div",
+                { A: "1", a: "2" },
+                false,
+            );
+        });
+
+        it("should report exact-name duplicates in XML mode, chunked and unchunked", () => {
+            const xml = '<div a="1" a="2"/>';
+
+            const single = vi.fn();
+            new Parser({ onduplicateattribute: single }, { xmlMode: true }).end(
+                xml,
+            );
+            expect(single).toHaveBeenCalledTimes(1);
+            expect(single).toHaveBeenCalledWith("div", "a", "2", "1");
+
+            const chunked = vi.fn();
+            const p = new Parser(
+                { onduplicateattribute: chunked },
+                { xmlMode: true },
+            );
+            for (const char of xml) {
+                p.write(char);
+            }
+            p.end();
+            expect(chunked).toHaveBeenCalledTimes(1);
+            expect(chunked).toHaveBeenCalledWith("div", "a", "2", "1");
+        });
+
+        it("should work without an onopentag handler", () => {
+            const onduplicateattribute = vi.fn();
+
+            new Parser({ onduplicateattribute }).end('<p a="1" a="2">');
+
+            expect(onduplicateattribute).toHaveBeenCalledTimes(1);
+            expect(onduplicateattribute).toHaveBeenCalledWith(
+                "p",
+                "a",
+                "2",
+                "1",
+            );
+        });
+    });
 });
