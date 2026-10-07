@@ -239,6 +239,19 @@ export interface Handler {
         value: string,
         quote?: string | undefined | null,
     ): void;
+    /**
+     * Observes duplicate attributes on a tag.
+     *
+     * Called once for every occurrence of an attribute whose name was
+     * already seen on the current tag. Attribute names are compared after
+     * case-folding in HTML mode (`lowerCaseAttributeNames`), and exactly
+     * in XML mode. The first occurrence is not reported, and the parser's
+     * first-value-wins selection for the final attribute map is unchanged.
+     * @param tagName Name of the tag the attribute appeared on.
+     * @param name Name of the duplicate attribute.
+     * @param value Value of this occurrence of the attribute.
+     */
+    onduplicateattribute?(tagName: string, name: string, value: string): void;
     onopentag(
         name: string,
         attribs: { [s: string]: string },
@@ -272,6 +285,8 @@ export class Parser implements Callbacks {
     private attribname = "";
     private attribvalue = "";
     private attribs: null | { [key: string]: string } = null;
+    /** Names of attributes already seen on the current tag, for duplicate observation. */
+    private attribnames: null | Set<string> = null;
     private readonly stack: string[] = [];
     private readonly foreignContext: ForeignContext[];
     private readonly cbs: Partial<Handler>;
@@ -437,6 +452,7 @@ export class Parser implements Callbacks {
         }
         this.cbs.onopentagname?.(name);
         if (this.cbs.onopentag) this.attribs = {};
+        if (this.cbs.onduplicateattribute) this.attribnames = new Set();
     }
 
     private endOpenTag(isImplied: boolean) {
@@ -446,6 +462,7 @@ export class Parser implements Callbacks {
             this.cbs.onopentag?.(this.tagname, this.attribs, isImplied);
             this.attribs = null;
         }
+        this.attribnames = null;
         if (this.cbs.onclosetag && this.isVoidElement(this.tagname)) {
             this.cbs.onclosetag(this.tagname, true);
         }
@@ -593,6 +610,18 @@ export class Parser implements Callbacks {
                     : null,
         );
 
+        if (this.attribnames) {
+            if (this.attribnames.has(this.attribname)) {
+                this.cbs.onduplicateattribute?.(
+                    this.tagname,
+                    this.attribname,
+                    this.attribvalue,
+                );
+            } else {
+                this.attribnames.add(this.attribname);
+            }
+        }
+
         if (this.attribs && !Object.hasOwn(this.attribs, this.attribname)) {
             this.attribs[this.attribname] = this.attribvalue;
         }
@@ -717,6 +746,7 @@ export class Parser implements Callbacks {
         this.attribname = "";
         this.attribvalue = "";
         this.attribs = null;
+        this.attribnames = null;
         this.stack.length = 0;
         this.startIndex = 0;
         this.endIndex = 0;

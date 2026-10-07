@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { Parser, Tokenizer } from "./index.js";
-import type { Handler } from "./Parser.js";
+import type { Handler, ParserOptions } from "./Parser.js";
 
 describe("API", () => {
     it("should work without callbacks", () => {
@@ -248,5 +248,95 @@ describe("API", () => {
             { Tokenizer: CustomTokenizer },
         );
         p.end();
+    });
+});
+
+describe("Duplicate attributes", () => {
+    const input = '<div A="1" a="2" A="3">x</div>';
+
+    function collect(options: ParserOptions, chunked: boolean) {
+        const duplicates: [string, string, string][] = [];
+        const attribs: { [key: string]: string }[] = [];
+        const parser = new Parser(
+            {
+                onduplicateattribute(tagName, name, value) {
+                    duplicates.push([tagName, name, value]);
+                },
+                onopentag(_name, attributes) {
+                    attribs.push({ ...attributes });
+                },
+            },
+            options,
+        );
+
+        if (chunked) {
+            // Write one character at a time to cover fragmented input.
+            for (let index = 0; index < input.length; index++) {
+                parser.write(input.charAt(index));
+            }
+            parser.end();
+        } else {
+            parser.end(input);
+        }
+
+        return { duplicates, attribs };
+    }
+
+    it("should report case-folded duplicates in HTML mode (single chunk)", () => {
+        const { duplicates, attribs } = collect({}, false);
+
+        expect(duplicates).toEqual([
+            ["div", "a", "2"],
+            ["div", "a", "3"],
+        ]);
+        // First occurrence still wins for the final attribute map.
+        expect(attribs).toEqual([{ a: "1" }]);
+    });
+
+    it("should report case-folded duplicates in HTML mode (char by char)", () => {
+        const { duplicates, attribs } = collect({}, true);
+
+        expect(duplicates).toEqual([
+            ["div", "a", "2"],
+            ["div", "a", "3"],
+        ]);
+        expect(attribs).toEqual([{ a: "1" }]);
+    });
+
+    it("should compare attribute names exactly in XML mode (single chunk)", () => {
+        const { duplicates, attribs } = collect({ xmlMode: true }, false);
+
+        expect(duplicates).toEqual([["div", "A", "3"]]);
+        expect(attribs).toEqual([{ A: "1", a: "2" }]);
+    });
+
+    it("should compare attribute names exactly in XML mode (char by char)", () => {
+        const { duplicates, attribs } = collect({ xmlMode: true }, true);
+
+        expect(duplicates).toEqual([["div", "A", "3"]]);
+        expect(attribs).toEqual([{ A: "1", a: "2" }]);
+    });
+
+    it("should not report duplicates across tags or after reset", () => {
+        const onduplicateattribute = vi.fn();
+        const parser = new Parser({ onduplicateattribute });
+
+        parser.end('<a A="1" A="2"></a><b A="3"></b>');
+        expect(onduplicateattribute).toHaveBeenCalledTimes(1);
+        expect(onduplicateattribute).toHaveBeenLastCalledWith("a", "a", "2");
+
+        parser.reset();
+        parser.end('<c A="4"></c>');
+        expect(onduplicateattribute).toHaveBeenCalledTimes(1);
+    });
+
+    it("should observe duplicates without an onopentag handler", () => {
+        const onduplicateattribute = vi.fn();
+        const parser = new Parser({ onduplicateattribute });
+
+        parser.end('<a x="1" x="2" x="3"></a>');
+        expect(onduplicateattribute).toHaveBeenCalledTimes(2);
+        expect(onduplicateattribute).toHaveBeenNthCalledWith(1, "a", "x", "2");
+        expect(onduplicateattribute).toHaveBeenNthCalledWith(2, "a", "x", "3");
     });
 });
