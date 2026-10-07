@@ -208,6 +208,22 @@ export interface ParserOptions {
      * Allows the default tokenizer to be overwritten.
      */
     Tokenizer?: typeof Tokenizer;
+
+    /**
+     * Enforce a strict parser lifecycle.
+     *
+     * When enabled, calling `write` or `end` after the parser has finished
+     * (ie. after `end` completed) throws an error instead of reporting it
+     * through the `onerror` callback. No events are emitted for input that
+     * arrives after the end of a document. Calling `reset` starts a new
+     * document and re-enables `write`/`end`.
+     *
+     * When disabled (the default), late `write`/`end` calls are reported via
+     * `onerror` and otherwise ignored, and repeated `end` calls never emit
+     * `onend` more than once per document.
+     * @default false
+     */
+    strictLifecycle?: boolean;
 }
 
 /**
@@ -288,6 +304,8 @@ export class Parser implements Callbacks {
     private writeIndex = 0;
     /** Indicates whether the parser has finished running / `.end` has been called. */
     private ended = false;
+    /** Whether late `write`/`end` calls throw instead of reporting via `onerror`. */
+    private readonly strictLifecycle: boolean;
 
     constructor(
         cbs?: Partial<Handler> | null,
@@ -300,6 +318,7 @@ export class Parser implements Callbacks {
             options.lowerCaseAttributeNames ?? this.htmlMode;
         this.recognizeSelfClosing =
             options.recognizeSelfClosing ?? !this.htmlMode;
+        this.strictLifecycle = options.strictLifecycle ?? false;
         this.tokenizer = new (options.Tokenizer ?? Tokenizer)(
             this.options,
             this,
@@ -773,7 +792,11 @@ export class Parser implements Callbacks {
      */
     write(chunk: string): void {
         if (this.ended) {
-            this.cbs.onerror?.(new Error(".write() after done!"));
+            const error = new Error(".write() after done!");
+            if (this.strictLifecycle) {
+                throw error;
+            }
+            this.cbs.onerror?.(error);
             return;
         }
 
@@ -790,7 +813,11 @@ export class Parser implements Callbacks {
      */
     end(chunk?: string): void {
         if (this.ended) {
-            this.cbs.onerror?.(new Error(".end() after done!"));
+            const error = new Error(".end() after done!");
+            if (this.strictLifecycle) {
+                throw error;
+            }
+            this.cbs.onerror?.(error);
             return;
         }
 

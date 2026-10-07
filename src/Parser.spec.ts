@@ -250,3 +250,155 @@ describe("API", () => {
         p.end();
     });
 });
+
+/**
+ * In-memory fixture recording every `write`/`end`/`reset` call plus the
+ * events emitted by the parser, so tests can assert on exact counts.
+ * @param options
+ * @param options.strictLifecycle
+ */
+function createRecorder(options?: { strictLifecycle: boolean }) {
+    const events: string[] = [];
+    const parser = new Parser(
+        {
+            ontext: (data) => events.push(`text:${data}`),
+            onopentag: (name) => events.push(`opentag:${name}`),
+            onend: () => events.push("onend"),
+            onreset: () => events.push("onreset"),
+            onerror: (error) => events.push(`onerror:${error.message}`),
+        },
+        options,
+    );
+    return {
+        events,
+        parser,
+        write(chunk: string) {
+            events.push(`write:${chunk}`);
+            parser.write(chunk);
+        },
+        end(chunk?: string) {
+            events.push("end");
+            parser.end(chunk);
+        },
+        reset() {
+            events.push("reset");
+            parser.reset();
+        },
+    };
+}
+
+describe("lifecycle", () => {
+    it("should throw on write after end in strict mode without emitting events", () => {
+        const fixture = createRecorder({ strictLifecycle: true });
+
+        fixture.write("<b>bold");
+        fixture.end("</b>");
+
+        const eventsAfterEnd = fixture.events.length;
+        expect(() => fixture.write("late")).toThrow(
+            new Error(".write() after done!"),
+        );
+        /*
+         * The failed write must not trigger any parser events; only the
+         * recorded call itself was added to the log.
+         */
+        expect(fixture.events.length).toBe(eventsAfterEnd + 1);
+        expect(fixture.events).toStrictEqual([
+            "write:<b>bold",
+            "opentag:b",
+            "text:bold",
+            "end",
+            "onend",
+            "write:late",
+        ]);
+    });
+
+    it("should not emit onend twice for repeated end calls in strict mode", () => {
+        const fixture = createRecorder({ strictLifecycle: true });
+
+        fixture.end("<i>x</i>");
+        expect(() => fixture.end()).toThrow(new Error(".end() after done!"));
+        expect(() => fixture.end("ignored")).toThrow(
+            new Error(".end() after done!"),
+        );
+
+        expect(
+            fixture.events.filter((event) => event === "onend"),
+        ).toHaveLength(1);
+        expect(fixture.events).toStrictEqual([
+            "end",
+            "opentag:i",
+            "text:x",
+            "onend",
+            "end",
+            "end",
+        ]);
+    });
+
+    it("should allow a new document after reset in strict mode", () => {
+        const fixture = createRecorder({ strictLifecycle: true });
+
+        fixture.end("<a>first</a>");
+        fixture.reset();
+        fixture.write("<b>second</b>");
+        fixture.end();
+
+        expect(fixture.events).toStrictEqual([
+            "end",
+            "opentag:a",
+            "text:first",
+            "onend",
+            "reset",
+            "onreset",
+            "write:<b>second</b>",
+            "opentag:b",
+            "text:second",
+            "end",
+            "onend",
+        ]);
+        expect(
+            fixture.events.filter((event) => event === "onend"),
+        ).toHaveLength(2);
+    });
+
+    it("should keep lenient behavior by default for write/end after done", () => {
+        const fixture = createRecorder();
+
+        fixture.end("<b>bold</b>");
+        const eventsAfterEnd = fixture.events.length;
+
+        // Late write/end calls report via onerror and emit no other events.
+        fixture.write("late");
+        fixture.end();
+        fixture.end("also late");
+
+        expect(
+            fixture.events.filter((event) => event === "onend"),
+        ).toHaveLength(1);
+        expect(
+            fixture.events.filter((event) => event.startsWith("onerror:")),
+        ).toStrictEqual([
+            "onerror:.write() after done!",
+            "onerror:.end() after done!",
+            "onerror:.end() after done!",
+        ]);
+        // No text/opentag events were emitted for the late input.
+        expect(
+            fixture.events
+                .slice(eventsAfterEnd)
+                .filter(
+                    (event) =>
+                        event.startsWith("text:") ||
+                        event.startsWith("opentag:"),
+                ),
+        ).toHaveLength(0);
+
+        // Reset still allows a new document in the default mode.
+        fixture.reset();
+        fixture.end("<i>next</i>");
+        expect(
+            fixture.events.filter((event) => event === "onend"),
+        ).toHaveLength(2);
+        expect(fixture.events.at(-2)).toBe("text:next");
+    });
+});
