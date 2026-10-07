@@ -25,6 +25,18 @@ describe("WritableStream", () => {
     it("RSS feed", () => testStream("RSS_Example.xml", { xmlMode: true }));
     it("Atom feed", () => testStream("Atom_Example.xml", { xmlMode: true }));
     it("RDF feed", () => testStream("RDF_Example.xml", { xmlMode: true }));
+
+    it("should pass strictLifecycle through to the parser", async () => {
+        const stream = new WritableStream({}, { strictLifecycle: true });
+        stream.end("<a>x</a>");
+        await finished(stream);
+
+        // @ts-expect-error Accessing private parser here
+        const parser = stream._parser as import("./Parser.js").Parser;
+        expect(() => parser.write("tail")).toThrow(".write() after done!");
+        // Repeated end is a no-op and does not throw in strict mode.
+        expect(() => parser.end()).not.toThrow();
+    });
 });
 
 function getPromiseEventCollector(): [

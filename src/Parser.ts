@@ -208,6 +208,19 @@ export interface ParserOptions {
      * Allows the default tokenizer to be overwritten.
      */
     Tokenizer?: typeof Tokenizer;
+
+    /**
+     * If set to `true`, the parser enforces a strict lifecycle:
+     * - Calling `write` after `end` throws an error instead of emitting
+     *   `onerror`, and no further events are triggered.
+     * - Calling `end` more than once is a no-op; `onend` is not emitted again.
+     * - Calling `reset` starts a new document and re-enables `write`/`end`.
+     *
+     * If `false` (the default), the parser keeps its lenient behavior of
+     * reporting lifecycle violations through the `onerror` callback.
+     * @default false
+     */
+    strictLifecycle?: boolean;
 }
 
 /**
@@ -278,6 +291,11 @@ export class Parser implements Callbacks {
     private readonly lowerCaseTagNames: boolean;
     private readonly lowerCaseAttributeNames: boolean;
     private readonly recognizeSelfClosing: boolean;
+    /**
+     * Whether lifecycle violations (eg. `write` after `end`) should throw
+     * instead of being reported through the `onerror` callback.
+     */
+    private readonly strictLifecycle: boolean;
     /** We are parsing HTML. Inverse of the `xmlMode` option. */
     private readonly htmlMode: boolean;
     private readonly tokenizer: Tokenizer;
@@ -300,6 +318,7 @@ export class Parser implements Callbacks {
             options.lowerCaseAttributeNames ?? this.htmlMode;
         this.recognizeSelfClosing =
             options.recognizeSelfClosing ?? !this.htmlMode;
+        this.strictLifecycle = options.strictLifecycle ?? false;
         this.tokenizer = new (options.Tokenizer ?? Tokenizer)(
             this.options,
             this,
@@ -773,6 +792,9 @@ export class Parser implements Callbacks {
      */
     write(chunk: string): void {
         if (this.ended) {
+            if (this.strictLifecycle) {
+                throw new Error(".write() after done!");
+            }
             this.cbs.onerror?.(new Error(".write() after done!"));
             return;
         }
@@ -790,6 +812,13 @@ export class Parser implements Callbacks {
      */
     end(chunk?: string): void {
         if (this.ended) {
+            if (this.strictLifecycle) {
+                /*
+                 * Repeated `end` calls are a no-op in strict mode;
+                 * `onend` must not be emitted again.
+                 */
+                return;
+            }
             this.cbs.onerror?.(new Error(".end() after done!"));
             return;
         }

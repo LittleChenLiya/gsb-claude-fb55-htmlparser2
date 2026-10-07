@@ -2,6 +2,22 @@ import { describe, expect, it, vi } from "vitest";
 import { Parser, Tokenizer } from "./index.js";
 import type { Handler } from "./Parser.js";
 
+function createEventLog(options?: { strictLifecycle?: boolean }) {
+    const events: string[] = [];
+    const parser = new Parser(
+        {
+            onreset: () => events.push("reset"),
+            onopentag: (name) => events.push(`opentag:${name}`),
+            ontext: (data) => events.push(`text:${data}`),
+            onclosetag: (name) => events.push(`closetag:${name}`),
+            onend: () => events.push("end"),
+            onerror: (error) => events.push(`error:${error.message}`),
+        },
+        options,
+    );
+    return { events, parser };
+}
+
 describe("API", () => {
     it("should work without callbacks", () => {
         const cbs: Partial<Handler> = { onerror: vi.fn() };
@@ -248,5 +264,101 @@ describe("API", () => {
             { Tokenizer: CustomTokenizer },
         );
         p.end();
+    });
+
+    describe("strictLifecycle", () => {
+        it("should throw on write after end without emitting events", () => {
+            const { events, parser } = createEventLog({
+                strictLifecycle: true,
+            });
+
+            parser.write("<a>foo</a>");
+            parser.end();
+            expect(events).toStrictEqual([
+                "opentag:a",
+                "text:foo",
+                "closetag:a",
+                "end",
+            ]);
+
+            // Tail write must throw and must not trigger any events.
+            expect(() => parser.write("<b>bar</b>")).toThrow(
+                ".write() after done!",
+            );
+            expect(events).toStrictEqual([
+                "opentag:a",
+                "text:foo",
+                "closetag:a",
+                "end",
+            ]);
+        });
+
+        it("should not emit onend again on repeated end calls", () => {
+            const { events, parser } = createEventLog({
+                strictLifecycle: true,
+            });
+
+            parser.end("<p>hi</p>");
+            parser.end();
+            parser.end("<div>ignored</div>");
+
+            expect(events).toStrictEqual([
+                "opentag:p",
+                "text:hi",
+                "closetag:p",
+                "end",
+            ]);
+            expect(events.filter((event) => event === "end")).toHaveLength(1);
+        });
+
+        it("should allow a new document after reset", () => {
+            const { events, parser } = createEventLog({
+                strictLifecycle: true,
+            });
+
+            parser.end("<i>one</i>");
+            parser.reset();
+            parser.write("<b>two</b>");
+            parser.end();
+
+            expect(events).toStrictEqual([
+                "opentag:i",
+                "text:one",
+                "closetag:i",
+                "end",
+                "reset",
+                "opentag:b",
+                "text:two",
+                "closetag:b",
+                "end",
+            ]);
+            expect(events.filter((event) => event === "end")).toHaveLength(2);
+        });
+
+        it("should keep lenient behavior by default", () => {
+            const { events, parser } = createEventLog();
+
+            parser.end("<u>x</u>");
+
+            // Tail write reports through onerror instead of throwing.
+            expect(() => parser.write("tail")).not.toThrow();
+            // Repeated end reports through onerror and doesn't re-emit onend.
+            expect(() => parser.end()).not.toThrow();
+
+            expect(events).toStrictEqual([
+                "opentag:u",
+                "text:x",
+                "closetag:u",
+                "end",
+                "error:.write() after done!",
+                "error:.end() after done!",
+            ]);
+            expect(events.filter((event) => event === "end")).toHaveLength(1);
+
+            // Reset still allows a new document in lenient mode.
+            parser.reset();
+            parser.end("<s>y</s>");
+            expect(events.filter((event) => event === "end")).toHaveLength(2);
+        });
     });
 });
